@@ -1,6 +1,6 @@
 [project]
 name = "hue-cli"
-version = "0.1.0"
+version = "0.2.0"
 description = "Deterministic local-LAN CLI for Philips Hue Bridges"
 readme = "README.md"
 license = { text = "MIT" }
