@@ -28,7 +28,9 @@ import click
 from hue_cli import __version__
 from hue_cli.logging_setup import setup_logging
 from hue_cli.output import detect
+from hue_cli.verbs.batch_cmd import batch_cmd
 from hue_cli.verbs.config_cmd import config_group
+from hue_cli.verbs.group_cmd import group_cmd_group
 from hue_cli.verbs.info_cmd import info_cmd
 from hue_cli.verbs.list_cmd import list_group
 from hue_cli.verbs.onoff_cmd import off_cmd, on_cmd, toggle_cmd
@@ -39,37 +41,131 @@ from hue_cli.verbs.set_cmd import set_cmd
 # --- Async graceful runner ---------------------------------------------------
 
 
-def _run_async_graceful(coro: Coroutine[Any, Any, Any]) -> Any:
+def _run_async_graceful(
+    coro: Coroutine[Any, Any, Any],
+    *,
+    session: Any | None = None,
+) -> Any:
     """Run an async coroutine via :func:`asyncio.run` with signal handling.
 
-    SIGINT  → exits 130 (FR-54c, Phase 1 shape).
-    SIGTERM → exits 143.
+    Two modes keyed off ``session``:
 
-    Phase 3 will elaborate this for batch-aware partial-result behavior
-    (emit ``{"event":"interrupted","completed":N,"pending":M}`` JSONL line
-    before exit). Phase 1 just needs the exit-code plumbing correct.
+    * ``session is None`` (single-verb invocations) — Phase 1 behavior:
+      SIGINT → exit 130, SIGTERM → exit 143, no drain attempt.
+    * ``session`` is a :class:`hue_cli.verbs.batch_cmd.BatchSession` — Phase
+      3 graceful-drain behavior (FR-54c):
+
+        1. On signal receipt set ``session.cancel_event`` so the dispatcher
+           stops scheduling new ops.
+        2. Wait up to 2 s for in-flight tasks to complete.
+        3. Emit ``{"event":"interrupted","completed":N,"pending":M}`` to
+           stdout — JSONL when batch is in JSON / JSONL mode, a human
+           sentence on stderr in TEXT mode.
+        4. Exit 130 (SIGINT) or 143 (SIGTERM).
+
+    On POSIX both SIGINT and SIGTERM are wired via
+    :meth:`asyncio.AbstractEventLoop.add_signal_handler` when a session is
+    supplied; on Windows only SIGINT is reachable (Python forbids
+    ``add_signal_handler`` on the ``ProactorEventLoop``) so we fall back to
+    a synchronous ``signal.signal`` shim that raises ``SystemExit``.
     """
     exit_sigint = 130
     exit_sigterm = 143
 
-    def _handle_sigterm(*_args: object) -> None:
-        # SIGTERM is unsettable on Windows main thread; if we get here we're
-        # on POSIX. Translate to a ``SystemExit(143)``.
-        raise SystemExit(exit_sigterm)
+    if session is None:
+        # Phase 1 path — preserved verbatim for non-batch verbs.
+        def _handle_sigterm(*_args: object) -> None:
+            raise SystemExit(exit_sigterm)
 
-    prior_term = signal.getsignal(signal.SIGTERM)
-    try:
-        with contextlib.suppress(OSError, ValueError):
-            signal.signal(signal.SIGTERM, _handle_sigterm)
+        prior_term = signal.getsignal(signal.SIGTERM)
         try:
-            return asyncio.run(coro)
-        except KeyboardInterrupt:
-            sys.exit(exit_sigint)
-        except SystemExit:
-            raise
-    finally:
-        with contextlib.suppress(OSError, ValueError):
-            signal.signal(signal.SIGTERM, prior_term)
+            with contextlib.suppress(OSError, ValueError):
+                signal.signal(signal.SIGTERM, _handle_sigterm)
+            try:
+                return asyncio.run(coro)
+            except KeyboardInterrupt:
+                sys.exit(exit_sigint)
+            except SystemExit:
+                raise
+        finally:
+            with contextlib.suppress(OSError, ValueError):
+                signal.signal(signal.SIGTERM, prior_term)
+
+    # Batch path — graceful drain (FR-54c).
+    received_signal: dict[str, int | None] = {"code": None}
+
+    async def _runner() -> Any:
+        loop = asyncio.get_running_loop()
+        # The session shares its cancel_event with the dispatcher; create
+        # it on the running loop so signal handlers can safely set it.
+        if session.cancel_event is None:
+            session.cancel_event = asyncio.Event()
+
+        def _on_signal(sig_name: str, exit_code: int) -> None:
+            received_signal["code"] = exit_code
+            assert session.cancel_event is not None
+            session.cancel_event.set()
+
+        # POSIX: hook both SIGINT and SIGTERM via the event loop.
+        with contextlib.suppress(NotImplementedError, RuntimeError):
+            loop.add_signal_handler(signal.SIGINT, _on_signal, "SIGINT", exit_sigint)
+        with contextlib.suppress(NotImplementedError, RuntimeError, AttributeError):
+            loop.add_signal_handler(signal.SIGTERM, _on_signal, "SIGTERM", exit_sigterm)
+
+        try:
+            return await coro
+        finally:
+            with contextlib.suppress(NotImplementedError, RuntimeError):
+                loop.remove_signal_handler(signal.SIGINT)
+            with contextlib.suppress(NotImplementedError, RuntimeError, AttributeError):
+                loop.remove_signal_handler(signal.SIGTERM)
+
+    try:
+        result = asyncio.run(_runner())
+    except KeyboardInterrupt:
+        # Windows fallback or pre-signal-handler-installed Ctrl-C.
+        received_signal["code"] = exit_sigint
+        result = None
+
+    if received_signal["code"] is not None:
+        _emit_interrupted_summary(session)
+        sys.exit(received_signal["code"])
+
+    return result
+
+
+def _emit_interrupted_summary(session: Any) -> None:
+    """Write the FR-54c summary line, format-aware.
+
+    JSON / JSONL → ``{"event":"interrupted","completed":N,"pending":M}`` to
+    stdout (JSONL one-liner). TEXT → human sentence on stderr.
+    QUIET → nothing.
+    """
+    from hue_cli.output import OutputFormat, emit_jsonl
+
+    fmt = getattr(session, "fmt", OutputFormat.TEXT)
+    payload = (
+        session.snapshot()
+        if hasattr(session, "snapshot")
+        else {
+            "event": "interrupted",
+            "completed": int(getattr(session, "completed", 0)),
+            "pending": int(getattr(session, "pending", 0)),
+        }
+    )
+
+    if fmt is OutputFormat.QUIET:
+        return
+    if fmt in (OutputFormat.JSON, OutputFormat.JSONL):
+        line = next(iter(emit_jsonl([payload])))
+        sys.stdout.write(line + "\n")
+        sys.stdout.flush()
+        return
+    # TEXT
+    sys.stderr.write(
+        f"interrupted: completed={payload['completed']} pending={payload['pending']}\n"
+    )
+    sys.stderr.flush()
 
 
 # --- Top-level group ---------------------------------------------------------
@@ -245,7 +341,9 @@ main.add_command(toggle_cmd, name="toggle")
 main.add_command(set_cmd, name="set")
 main.add_command(scene_group, name="scene")
 main.add_command(sensor_group, name="sensor")
+main.add_command(group_cmd_group, name="group")
 main.add_command(config_group, name="config")
+main.add_command(batch_cmd, name="batch")
 
 
 # Part A verbs — registered only when Engineer A's modules are importable.

@@ -76,7 +76,12 @@ class HueWrapper:
         self.host = host
         self.app_key = app_key
         self._bridge: Any | None = None
-        self._owns_connection = False
+        # Depth counter so ``async with`` is re-entrant. The wrapper is held
+        # open from the outermost entry until the matching outermost exit;
+        # nested ``async with wrapper:`` blocks (e.g., per-line verbs called
+        # from inside ``batch``'s outer wrap) become true no-ops, amortising
+        # the TLS handshake across the whole batch.
+        self._owns_connection: int = 0
 
     @property
     def bridge(self) -> Any:
@@ -87,8 +92,9 @@ class HueWrapper:
         return self._bridge
 
     async def __aenter__(self) -> HueWrapper:
-        await self._open()
-        self._owns_connection = True
+        if self._owns_connection == 0:
+            await self._open()
+        self._owns_connection += 1
         return self
 
     async def __aexit__(
@@ -97,8 +103,13 @@ class HueWrapper:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
-        await self._close()
-        self._owns_connection = False
+        # Defensively floor at 0 — an external caller calling __aexit__
+        # without a matching __aenter__ would otherwise drive us negative
+        # and skip the close on a later genuine exit.
+        if self._owns_connection > 0:
+            self._owns_connection -= 1
+        if self._owns_connection == 0:
+            await self._close()
 
     async def _open(self) -> None:
         if self._bridge is not None:
