@@ -121,6 +121,18 @@ class FakeWrapper:
     async def get_all_lights_group(self) -> FakeGroup:
         return self._all_lights_group
 
+    async def __aenter__(self) -> "FakeWrapper":
+        self.aenter_calls = getattr(self, "aenter_calls", 0) + 1
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: Any,
+    ) -> None:
+        self.aexit_calls = getattr(self, "aexit_calls", 0) + 1
+
 
 # --- Helpers ----------------------------------------------------------------
 

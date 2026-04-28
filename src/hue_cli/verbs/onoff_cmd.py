@@ -48,71 +48,85 @@ async def _apply_power(
     Returns a small result dict suitable for JSON / JSONL emission. For
     light targets, an ``unreachable`` warning is emitted on stderr per
     FR-26 when ``state.reachable == False``.
+
+    Wraps the resolve + dispatch pair in ``async with wrapper`` so that the
+    underlying aiohttp ``ClientSession`` stays alive across both calls. The
+    Light/Group object returned by ``resolve_target`` carries a ``_request``
+    bound to that session — without the shared connection lifetime, the
+    follow-up ``set_state``/``set_action`` would raise
+    ``RuntimeError: Session is closed`` on a real bridge.
     """
-    if target == "all":
-        group = await wrapper.get_all_lights_group()
-        await wrapper.group_set_on(group, on)
-        return {"target": "all", "kind": "group", "on": on}
+    async with wrapper:
+        if target == "all":
+            group = await wrapper.get_all_lights_group()
+            await wrapper.group_set_on(group, on)
+            return {"target": "all", "kind": "group", "on": on}
 
-    resolved = await wrapper.resolve_target(target)
-    kind = resolved.get("kind")
-    record = resolved.get("record", {})
-    obj = resolved.get("object")
+        resolved = await wrapper.resolve_target(target)
+        kind = resolved.get("kind")
+        record = resolved.get("record", {})
+        obj = resolved.get("object")
 
-    if kind == "light":
-        await wrapper.light_set_on(cast("LightProto", obj), on)
-        state = record.get("state", {}) if isinstance(record, dict) else {}
-        if isinstance(state, dict) and state.get("reachable") is False:
-            click.echo(
-                f"warning: light {target!r} is not reachable; command queued by bridge",
-                err=True,
-            )
-        return {"target": target, "kind": "light", "on": on}
+        if kind == "light":
+            await wrapper.light_set_on(cast("LightProto", obj), on)
+            state = record.get("state", {}) if isinstance(record, dict) else {}
+            if isinstance(state, dict) and state.get("reachable") is False:
+                click.echo(
+                    f"warning: light {target!r} is not reachable; command queued by bridge",
+                    err=True,
+                )
+            return {"target": target, "kind": "light", "on": on}
 
-    if kind in ("room", "zone"):
-        await wrapper.group_set_on(cast("GroupProto", obj), on)
-        return {"target": target, "kind": kind, "on": on}
+        if kind in ("room", "zone"):
+            await wrapper.group_set_on(cast("GroupProto", obj), on)
+            return {"target": target, "kind": kind, "on": on}
 
-    raise click.ClickException(f"target {target!r} is not a light or group (kind={kind!r})")
+        raise click.ClickException(f"target {target!r} is not a light or group (kind={kind!r})")
 
 
 async def _apply_toggle(wrapper: HueWrapperProto, target: str) -> dict[str, Any]:
-    """Resolve the target and flip its on/off state per FR-24 + Decision 4."""
-    if target == "all":
-        group = await wrapper.get_all_lights_group()
-        # Decision 4 applied to the implicit "all" group: read the wrapper's
-        # group record so all_on / any_on are visible.
-        all_on = bool(getattr(group, "state", {}).get("all_on", False))
-        next_on = not all_on
-        await wrapper.group_set_on(group, next_on)
-        return {"target": "all", "kind": "group", "on": next_on}
+    """Resolve the target and flip its on/off state per FR-24 + Decision 4.
 
-    resolved = await wrapper.resolve_target(target)
-    kind = resolved.get("kind")
-    record = resolved.get("record", {})
-    obj = resolved.get("object")
+    Like ``_apply_power``, the resolve + dispatch pair runs inside a single
+    ``async with wrapper`` block so the aiohttp session stays alive for the
+    Light/Group object's bound ``_request`` callable.
+    """
+    async with wrapper:
+        if target == "all":
+            group = await wrapper.get_all_lights_group()
+            # Decision 4 applied to the implicit "all" group: read the wrapper's
+            # group record so all_on / any_on are visible.
+            all_on = bool(getattr(group, "state", {}).get("all_on", False))
+            next_on = not all_on
+            await wrapper.group_set_on(group, next_on)
+            return {"target": "all", "kind": "group", "on": next_on}
 
-    if kind == "light":
-        state = record.get("state", {}) if isinstance(record, dict) else {}
-        was_on = bool(state.get("on")) if isinstance(state, dict) else False
-        next_on = not was_on
-        await wrapper.light_set_on(cast("LightProto", obj), next_on)
-        if isinstance(state, dict) and state.get("reachable") is False:
-            click.echo(
-                f"warning: light {target!r} is not reachable; command queued by bridge",
-                err=True,
-            )
-        return {"target": target, "kind": "light", "on": next_on}
+        resolved = await wrapper.resolve_target(target)
+        kind = resolved.get("kind")
+        record = resolved.get("record", {})
+        obj = resolved.get("object")
 
-    if kind in ("room", "zone"):
-        # Decision 4: consolidate-on. all_on=True → off; otherwise → on.
-        state = record.get("state", {}) if isinstance(record, dict) else {}
-        all_on = bool(state.get("all_on")) if isinstance(state, dict) else False
-        next_on = not all_on
-        await wrapper.group_set_on(cast("GroupProto", obj), next_on)
-        return {"target": target, "kind": kind, "on": next_on}
+        if kind == "light":
+            state = record.get("state", {}) if isinstance(record, dict) else {}
+            was_on = bool(state.get("on")) if isinstance(state, dict) else False
+            next_on = not was_on
+            await wrapper.light_set_on(cast("LightProto", obj), next_on)
+            if isinstance(state, dict) and state.get("reachable") is False:
+                click.echo(
+                    f"warning: light {target!r} is not reachable; command queued by bridge",
+                    err=True,
+                )
+            return {"target": target, "kind": "light", "on": next_on}
 
-    raise click.ClickException(f"target {target!r} is not toggleable (kind={kind!r})")
+        if kind in ("room", "zone"):
+            # Decision 4: consolidate-on. all_on=True → off; otherwise → on.
+            state = record.get("state", {}) if isinstance(record, dict) else {}
+            all_on = bool(state.get("all_on")) if isinstance(state, dict) else False
+            next_on = not all_on
+            await wrapper.group_set_on(cast("GroupProto", obj), next_on)
+            return {"target": target, "kind": kind, "on": next_on}
+
+        raise click.ClickException(f"target {target!r} is not toggleable (kind={kind!r})")
 
 
 @click.command(name="on")

@@ -18,6 +18,7 @@ exercised without aiohue / aiohttp at all.
 
 from __future__ import annotations
 
+from types import TracebackType
 from typing import Any, Protocol
 
 
@@ -100,3 +101,20 @@ class HueWrapperProto(Protocol):
 
     async def get_all_lights_group(self) -> GroupProto:
         """Return the special Group 0 (all lights) for ``all`` target."""
+
+    async def __aenter__(self) -> HueWrapperProto:
+        """Open the underlying bridge connection for the ``async with`` block.
+
+        Compose verbs (``on``/``off``/``toggle``) wrap a resolve+dispatch pair
+        in ``async with`` so the aiohttp ``ClientSession`` stays alive across
+        both calls — the Light/Group object returned by ``resolve_target``
+        carries a bound ``_request`` that would otherwise outlive its session.
+        """
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        """Close the underlying bridge connection at block exit."""
