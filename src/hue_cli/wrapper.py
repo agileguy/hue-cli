@@ -268,6 +268,35 @@ class HueWrapper:
         finally:
             await self._maybe_close()
 
+    async def light_set_state(self, light: Any, **state: Any) -> None:
+        """Apply arbitrary state to a light (FR-27..38 dispatch helper).
+
+        The ``set`` verb assembles the ``state`` kwargs (``bri``, ``ct``,
+        ``xy``, ``effect``, ``alert``, ``transitiontime``, possibly ``on``
+        from a brightness=0 mapping) and calls this method. Pass-through to
+        ``light.set_state(**state)`` keeps aiohue out of the verb layer,
+        matching the §4 wrapper-only-imports-aiohue rule.
+        """
+        await self._ensure()
+        try:
+            await light.set_state(**state)
+        finally:
+            await self._maybe_close()
+
+    async def group_set_action(self, group: Any, **action: Any) -> None:
+        """Apply arbitrary action to a group (FR-27..38 dispatch helper).
+
+        Same shape as :meth:`light_set_state` but routes through
+        ``Group.set_action``. Used for room/zone targets and for the
+        synthetic ``all`` group from
+        :meth:`~aiohue.AllLightsGroup.get_all_lights_group`.
+        """
+        await self._ensure()
+        try:
+            await group.set_action(**action)
+        finally:
+            await self._maybe_close()
+
     async def get_all_lights_group(self) -> Any:
         """Return the special Group 0 (all-lights) for the literal ``all`` target (FR-22)."""
         bridge = await self._ensure()
@@ -275,6 +304,155 @@ class HueWrapper:
             return await bridge.groups.get_all_lights_group()
         finally:
             await self._maybe_close()
+
+    async def apply_scene(
+        self,
+        scene_id: str,
+        group_id: str | None,
+        *,
+        transitiontime: int | None,
+    ) -> None:
+        """Apply ``scene_id`` via the bridge (FR-39).
+
+        For modern ``GroupScene`` entries, ``group_id`` is the scene's owning group
+        and the call is ``bridge.groups[group_id].set_action(scene=scene_id, ...)``.
+
+        For legacy ``LightScene`` entries (no group), pass ``group_id=None`` and
+        the wrapper falls back to the all-lights group recall — the bridge
+        filters the recall to the scene's ``lights`` array, matching operator
+        expectation per FR-39.
+
+        ``transitiontime`` is in deciseconds (the bridge's wire unit). Caller is
+        responsible for the ms->ds conversion (``round(ms/100)``); ``None`` lets
+        per-light scene-embedded transitions stand.
+        """
+        bridge = await self._ensure()
+        try:
+            kwargs: dict[str, Any] = {"scene": scene_id}
+            if transitiontime is not None:
+                kwargs["transitiontime"] = transitiontime
+            if group_id is None:
+                group = await bridge.groups.get_all_lights_group()
+                await group.set_action(**kwargs)
+            else:
+                await bridge.groups[group_id].set_action(**kwargs)
+        finally:
+            await self._maybe_close()
+
+
+def shape_sensor_info(record: dict[str, Any]) -> dict[str, Any]:
+    """Project a §10.5 sensor record into FR-47 type-shaped output.
+
+    Pure transformation: takes the wrapper-materialized record (id / name /
+    type / model_id / unique_id / state / config) and returns a dict with the
+    type-specific fields the operator expects from ``hue-cli sensor info``.
+
+    Behavior by sensor ``type`` (FR-47):
+
+    * ``ZLLPresence``           — ``presence``, ``lastupdated`` (ISO8601),
+      ``battery``, ``reachable``
+    * ``ZLLSwitch`` / ``ZGPSwitch`` — ``buttonevent`` (last button code),
+      ``lastupdated``
+    * ``ZLLTemperature``        — ``temperature`` as ``float`` °C
+      (bridge reports centi-Celsius; e.g. ``2150 -> 21.5``)
+    * ``ZLLLightLevel``         — ``lightlevel`` (raw uint), ``dark``,
+      ``daylight``
+    * ``Daylight``              — ``daylight`` bool plus ``sunrise`` /
+      ``sunset`` from ``config``
+    * ``CLIP*`` virtual sensors — raw ``state`` and ``config`` passthrough
+
+    The id / name / type / model_id / unique_id keys from the input record
+    are preserved on every shape so the output is a self-describing object
+    operators can pipe to ``jq`` without consulting a separate listing.
+    """
+
+    base: dict[str, Any] = {
+        "id": record.get("id", ""),
+        "name": record.get("name", ""),
+        "type": record.get("type"),
+        "model_id": record.get("model_id"),
+        "unique_id": record.get("unique_id"),
+    }
+    state: dict[str, Any] = record.get("state") or {}
+    config: dict[str, Any] = record.get("config") or {}
+    sensor_type = record.get("type") or ""
+
+    if sensor_type == "ZLLPresence":
+        base.update(
+            {
+                "presence": state.get("presence"),
+                "lastupdated": state.get("lastupdated"),
+                "battery": config.get("battery"),
+                "reachable": config.get("reachable"),
+            }
+        )
+        return base
+
+    if sensor_type in ("ZLLSwitch", "ZGPSwitch"):
+        base.update(
+            {
+                "buttonevent": state.get("buttonevent"),
+                "lastupdated": state.get("lastupdated"),
+            }
+        )
+        # Battery / reachable are present on ZLLSwitch (battery-powered) but
+        # absent on ZGPSwitch (energy-harvesting). Surface only when set.
+        if "battery" in config:
+            base["battery"] = config["battery"]
+        if "reachable" in config:
+            base["reachable"] = config["reachable"]
+        return base
+
+    if sensor_type == "ZLLTemperature":
+        raw_temp = state.get("temperature")
+        if isinstance(raw_temp, (int, float)):
+            celsius: float | None = round(float(raw_temp) / 100.0, 2)
+        else:
+            celsius = None
+        base.update(
+            {
+                "temperature": celsius,
+                "lastupdated": state.get("lastupdated"),
+            }
+        )
+        if "battery" in config:
+            base["battery"] = config["battery"]
+        if "reachable" in config:
+            base["reachable"] = config["reachable"]
+        return base
+
+    if sensor_type == "ZLLLightLevel":
+        base.update(
+            {
+                "lightlevel": state.get("lightlevel"),
+                "dark": state.get("dark"),
+                "daylight": state.get("daylight"),
+                "lastupdated": state.get("lastupdated"),
+            }
+        )
+        if "battery" in config:
+            base["battery"] = config["battery"]
+        if "reachable" in config:
+            base["reachable"] = config["reachable"]
+        return base
+
+    if sensor_type == "Daylight":
+        base.update(
+            {
+                "daylight": state.get("daylight"),
+                "lastupdated": state.get("lastupdated"),
+                "sunrise": config.get("sunriseoffset"),
+                "sunset": config.get("sunsetoffset"),
+                "configured": config.get("configured"),
+                "latitude": config.get("lat"),
+                "longitude": config.get("long"),
+            }
+        )
+        return base
+
+    # CLIP* virtual sensors and any unrecognized type: passthrough.
+    base.update({"state": dict(state), "config": dict(config)})
+    return base
 
 
 def _eq_ci(a: str, b: str) -> bool:
