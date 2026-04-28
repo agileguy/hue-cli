@@ -31,6 +31,7 @@ from hue_cli.verbs.config_cmd import config_group
 from hue_cli.verbs.info_cmd import info_cmd
 from hue_cli.verbs.list_cmd import list_group
 from hue_cli.verbs.onoff_cmd import off_cmd, on_cmd, toggle_cmd
+from hue_cli.verbs.set_cmd import set_cmd
 
 # --- Async graceful runner ---------------------------------------------------
 
@@ -204,6 +205,7 @@ main.add_command(info_cmd, name="info")
 main.add_command(on_cmd, name="on")
 main.add_command(off_cmd, name="off")
 main.add_command(toggle_cmd, name="toggle")
+main.add_command(set_cmd, name="set")
 main.add_command(config_group, name="config")
 
 
