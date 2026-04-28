@@ -12,6 +12,7 @@ import math
 import pytest
 
 from hue_cli.colors import (
+    GAMUT_B,
     hex_to_xy,
     hsv_to_xy,
     kelvin_to_mireds,
@@ -62,6 +63,16 @@ class TestNamedColors:
         assert table["warm-white"] != table["daylight"]
         assert table["cool-white"] != table["daylight"]
 
+    def test_cool_white_targets_4000k_not_d65(self) -> None:
+        # Operator UX: ``--color cool-white`` should land near 4000K
+        # (Planckian locus ≈ (0.3804, 0.3768)), matching the consumer Hue
+        # preset for "cool white". D65 (6500K) lives under ``daylight``.
+        x, y = named_colors()["cool-white"]
+        assert math.isclose(x, 0.3804, abs_tol=0.01), f"cool-white x={x} should be ≈0.3804"
+        assert math.isclose(y, 0.3768, abs_tol=0.01), f"cool-white y={y} should be ≈0.3768"
+        # And explicitly NOT the D65 white point.
+        assert (x, y) != (0.3127, 0.3290)
+
 
 # --- hex_to_xy (FR-31) -------------------------------------------------------
 
@@ -103,16 +114,14 @@ class TestHexToXy:
         # Gamut B (a 2014-era common gamut) — narrower than sRGB primary red.
         # An out-of-gamut ``#FF0000`` should clamp to a point inside the
         # supplied triangle.
-        gamut_b = [[0.6750, 0.3220], [0.4090, 0.5180], [0.1670, 0.0400]]
-        x, y = hex_to_xy("#FF0000", gamut=gamut_b)
+        x, y = hex_to_xy("#FF0000", gamut=GAMUT_B)
         # Inside-triangle test: barycentric signs all match.
-        assert _point_in_triangle((x, y), gamut_b)
+        assert _point_in_triangle((x, y), GAMUT_B)
 
     def test_in_gamut_point_unchanged_by_gamut_clamp(self) -> None:
         # White is inside virtually every gamut.
-        gamut_b = [[0.6750, 0.3220], [0.4090, 0.5180], [0.1670, 0.0400]]
-        x, y = hex_to_xy("#FFFFFF", gamut=gamut_b)
-        assert _point_in_triangle((x, y), gamut_b)
+        x, y = hex_to_xy("#FFFFFF", gamut=GAMUT_B)
+        assert _point_in_triangle((x, y), GAMUT_B)
 
 
 def _point_in_triangle(p: tuple[float, float], tri: list[list[float]]) -> bool:

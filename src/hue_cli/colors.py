@@ -13,10 +13,11 @@ Conversions provided:
 * :func:`hsv_to_xy`          — FR-33, HSV → RGB → ``hex_to_xy`` path
 * :func:`named_colors`       — FR-32, the 12 built-in name → xy entries
 
-The named-color values come from D65 chromaticity tables — `warm-white` at
-≈2700K, `cool-white` at ≈6500K (the D65 white point itself), `daylight` at
-≈5000K, plus eight saturated hues. Built-in (not config-supplied) so behavior
-is identical across machines, mirroring `kasa-cli` FR-19a/19b.
+The named-color values come from black-body / D-illuminant chromaticity
+tables — `warm-white` at ≈2700K, `cool-white` at ≈4000K (the consumer Hue
+preset; D65 / 6500K lives under `daylight`), `daylight` at ≈5000K, plus eight
+saturated hues. Built-in (not config-supplied) so behavior is identical
+across machines, mirroring `kasa-cli` FR-19a/19b.
 
 sRGB → XYZ uses the standard D65 matrix; the inverse gamma is the piecewise
 ``< 0.04045 ? c/12.92 : ((c+0.055)/1.055)**2.4`` curve. xy is the projective
@@ -35,14 +36,22 @@ from hue_cli.errors import UsageError
 # --- Named-color table (FR-32) ----------------------------------------------
 
 # CIE 1931 (x, y) coordinates. The whites come from black-body / D-illuminant
-# chromaticity tables (warm-white ≈2700K, cool-white = D65, daylight ≈5000K =
-# D50ish). The saturated hues are conventional sRGB primary/secondary values
+# chromaticity tables: warm-white ≈2700K, cool-white ≈4000K (the consumer
+# Hue "cool white" preset; not D65, which Hue ships as "daylight"), daylight
+# ≈5000K. The saturated hues are conventional sRGB primary/secondary values
 # converted via the same matrix this module uses for ``--hex``; checked into
 # the table directly so ``--color red`` is byte-identical regardless of the
 # host's float precision.
+#
+# Note on cool-white: D65 (≈6500K) is the "white-point convention" reading
+# but mismatches the operator mental model — Hue's app and most consumer
+# presets place cool-white near 4000K and reserve 6500K for "daylight". An
+# operator typing ``--color cool-white`` reaches for the 4000K preset, so
+# we pin to the Planckian locus at 4000K (≈(0.3804, 0.3768)) and keep the
+# D65 white-point under ``daylight`` only when the operator explicitly asks.
 _NAMED_COLORS: Mapping[str, tuple[float, float]] = {
     "warm-white": (0.4596, 0.4105),
-    "cool-white": (0.3127, 0.3290),
+    "cool-white": (0.3804, 0.3768),
     "daylight": (0.3457, 0.3585),
     "red": (0.6750, 0.3220),
     "orange": (0.6116, 0.3621),
