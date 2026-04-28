@@ -29,6 +29,7 @@ from hue_cli import __version__
 from hue_cli.logging_setup import setup_logging
 from hue_cli.output import detect
 from hue_cli.verbs.config_cmd import config_group
+from hue_cli.verbs.group_cmd import group_cmd_group
 from hue_cli.verbs.info_cmd import info_cmd
 from hue_cli.verbs.list_cmd import list_group
 from hue_cli.verbs.onoff_cmd import off_cmd, on_cmd, toggle_cmd
@@ -245,6 +246,7 @@ main.add_command(toggle_cmd, name="toggle")
 main.add_command(set_cmd, name="set")
 main.add_command(scene_group, name="scene")
 main.add_command(sensor_group, name="sensor")
+main.add_command(group_cmd_group, name="group")
 main.add_command(config_group, name="config")
 
 
