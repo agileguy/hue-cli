@@ -93,6 +93,61 @@ def emit_jsonl(records: Iterable[dict[str, Any]]) -> Iterator[str]:
         yield json.dumps(payload, separators=(",", ":"), sort_keys=True)
 
 
+def emit_batch_result(record: dict[str, Any], fmt: OutputFormat) -> str:
+    """Render one per-line batch result for stdout (FR-53 / FR-54 / FR-57b).
+
+    Used by the ``batch`` verb to emit a single result object per parsed
+    line of input. The shape of ``record`` is the batch verb's contract:
+
+    * ``line``        — the original input line (e.g., ``set kitchen --bri 30``)
+    * ``ok``          — bool: did this sub-operation succeed?
+    * ``error``       — str (optional): failure category if ``ok`` is False
+    * ``duration_ms`` — float (optional): wall-clock duration of the call
+    * additional fields the batch verb chooses to surface (target, kind, etc.)
+
+    Output by format:
+
+    * ``QUIET`` — empty string (caller should not write it)
+    * ``JSON``  — pretty multi-line JSON (matches :func:`emit_json`)
+    * ``JSONL`` — single compact JSON line (matches :func:`emit_jsonl`),
+      no trailing newline; the caller appends ``\\n``
+    * ``TEXT``  — short single-line summary suitable for human eyes::
+
+          ok          12ms  set kitchen --brightness 30
+          fail        45ms  on @nonsense
+
+    The TEXT layout aligns the status (8 chars, left-padded with spaces) and
+    duration (6 chars, right-aligned) so a stream of batch results reads as a
+    column-aligned log. ``error`` (when present and ``ok`` is False) replaces
+    ``fail`` so the operator sees the failure category at a glance.
+
+    This helper is intentionally decoupled from the batch verb itself —
+    :mod:`hue_cli.output` does not import :mod:`hue_cli.verbs.batch_cmd`.
+    The batch verb imports from here, not the other way around.
+    """
+
+    if fmt is OutputFormat.QUIET:
+        return ""
+    if fmt is OutputFormat.JSON:
+        return emit_json(record)
+    if fmt is OutputFormat.JSONL:
+        # ``emit_jsonl`` is a generator; ``next(iter(...))`` extracts the
+        # single line we need without materializing a list.
+        return next(iter(emit_jsonl([record])))
+
+    line_text = record.get("line", "")
+    ok = bool(record.get("ok", False))
+    error = record.get("error")
+    duration_raw = record.get("duration_ms", 0)
+    try:
+        duration_ms = float(duration_raw) if duration_raw is not None else 0.0
+    except (TypeError, ValueError):
+        duration_ms = 0.0
+
+    status = "ok" if ok else (str(error) if error else "fail")
+    return f"{status:<8} {duration_ms:>6.0f}ms  {line_text}"
+
+
 def emit_text(records: list[dict[str, Any]], columns: list[str]) -> str:
     """Render ``records`` as a column-aligned text table.
 
