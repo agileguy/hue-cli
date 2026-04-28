@@ -108,8 +108,18 @@ async def test_run_batch_honors_pre_set_cancel_event() -> None:
 
 @pytest.mark.asyncio
 async def test_run_batch_drains_in_flight_within_two_seconds() -> None:
-    """Cancelling mid-flight allows in-flight tasks to finish, leaving the rest pending."""
-    wrapper = _DrainFakeWrapper(delay=0.5)
+    """SIGINT mid-batch: drain bounds wait to <=2s, summary inputs are accurate.
+
+    Schedules a cancel via ``asyncio.create_task`` BEFORE awaiting
+    ``_run_batch`` so the cancel fires while the dispatcher is mid-flight
+    (some tasks running, some queued behind the semaphore). Per FR-54c the
+    in-flight set gets up to 2 s to finish; anything still pending is
+    cancelled. Wall-clock elapsed must be bounded by drain_budget + slack.
+    """
+    # 8 lines, each blocked on a 5 s sleep, with concurrency=2 — at any
+    # moment exactly 2 are in flight and 6 are queued waiting on the
+    # semaphore. Firing cancel ~0.1 s in guarantees a real mid-flight state.
+    wrapper = _DrainFakeWrapper(delay=5.0)
     parsed_lines = [ParsedLine(raw=f"on @{i}", verb="on", target=f"@{i}") for i in range(8)]
 
     cancel = asyncio.Event()
@@ -119,24 +129,79 @@ async def test_run_batch_drains_in_flight_within_two_seconds() -> None:
         cancel_event=cancel,
     )
 
-    # Cancel after 50ms — well before 0.5s sleeps complete.
-    async def cancel_soon() -> None:
+    async def cancel_after() -> None:
+        await asyncio.sleep(0.1)
+        cancel.set()
+
+    asyncio.create_task(cancel_after())  # noqa: RUF006 — fire-and-forget by design
+
+    start = time.monotonic()
+    pairs = await _run_batch(wrapper, parsed_lines, concurrency=2, session=session)
+    elapsed = time.monotonic() - start
+
+    # Drain budget enforced — must NOT block on the 5 s slow sleeps.
+    assert elapsed < 2.5, f"drain exceeded 2 s budget: {elapsed:.2f}s"
+    # Real cancellation happened — at least some lines never produced a result.
+    assert session.pending > 0, "no lines were left pending — cancel didn't fire mid-flight"
+    # Accounting holds: every input line is either completed or pending.
+    assert session.completed + session.pending == len(parsed_lines)
+    # Returned pair count matches the completed count.
+    assert len(pairs) == session.completed
+    # Cancel event observed.
+    assert session.cancel_event is not None and session.cancel_event.is_set()
+
+
+@pytest.mark.asyncio
+async def test_run_batch_streams_partial_results_before_cancel() -> None:
+    """Mid-flight cancel preserves a faithful per-line transcript via on_result.
+
+    A SIGINT-during-batch shouldn't lose the records for lines that DID
+    finish before the cancel — operators need to know which N of M succeeded.
+    The streaming ``on_result`` callback fires once per completed task in
+    completion order; the batch verb routes those to stdout in JSONL mode.
+    """
+    # Fast tasks (~10 ms) so a handful complete in the 0.2 s grace window
+    # before cancel fires; concurrency=2 keeps queue length predictable.
+    wrapper = _DrainFakeWrapper(delay=0.01)
+    parsed_lines = [ParsedLine(raw=f"on @{i}", verb="on", target=f"@{i}") for i in range(20)]
+
+    cancel = asyncio.Event()
+    session = BatchSession(
+        fmt=OutputFormat.JSONL,
+        total=len(parsed_lines),
+        cancel_event=cancel,
+    )
+
+    streamed: list[tuple[int, str]] = []
+
+    def _on_result(idx: int, parsed: ParsedLine, _task: Any) -> None:
+        streamed.append((idx, parsed.raw))
+
+    async def cancel_after() -> None:
+        # Long enough to let a few tasks finish; short enough to hit
+        # the gather mid-batch.
         await asyncio.sleep(0.05)
         cancel.set()
 
-    # Start the cancel task in parallel with the run. Because we set cancel
-    # *before* the ``for`` loop in ``_run_batch`` re-checks (which happens
-    # only once at the top), but the dispatch loop is synchronous in
-    # creating tasks — the cancel event matters at the next iteration.
-    # The simpler verification: pre-cancel by setting before call. We
-    # already covered that. Here we just exercise the wait path.
-    cancel.set()
-    pairs = await _run_batch(wrapper, parsed_lines, concurrency=2, session=session)
-    # Pre-cancelled: no pairs returned, all pending.
-    assert len(pairs) == 0
-    assert session.pending == 8
+    asyncio.create_task(cancel_after())  # noqa: RUF006
 
-    await cancel_soon()  # exercise the helper for coverage
+    pairs = await _run_batch(
+        wrapper,
+        parsed_lines,
+        concurrency=2,
+        session=session,
+        on_result=_on_result,
+    )
+
+    # Streamed callback fired for at least one completed task — the partial
+    # transcript is preserved.
+    assert len(streamed) >= 1, "no partial results were streamed before cancel"
+    # ``pairs`` length matches ``session.completed`` and the streamed count.
+    assert len(pairs) == session.completed
+    assert len(pairs) >= len(streamed) - 1  # tolerance: 1 task may complete during cleanup
+    # Streamed indices fall within input range.
+    for idx, _raw in streamed:
+        assert 0 <= idx < len(parsed_lines)
 
 
 # ---------------------------------------------------------------------------

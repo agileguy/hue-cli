@@ -386,14 +386,17 @@ class TestFileAndStdinParity:
         assert from_file.exit_code == 0
         assert from_stdin.exit_code == 0
 
-        # Each output line is JSON; the duration_ms field varies between runs,
-        # so compare the records modulo duration_ms.
+        # Each output line is JSON; the duration_ms field varies between
+        # runs (so we drop it) and JSONL records stream in completion-order
+        # rather than input-order (so we sort by the original ``line``
+        # field for stable comparison).
         def _normalize(text: str) -> list[dict[str, Any]]:
             recs = []
             for line in text.strip().splitlines():
                 rec = json.loads(line)
                 rec.pop("duration_ms", None)
                 recs.append(rec)
+            recs.sort(key=lambda r: r["line"])
             return recs
 
         assert _normalize(from_file.output) == _normalize(from_stdin.output)
