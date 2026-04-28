@@ -27,7 +27,14 @@ from zeroconf.asyncio import (
     AsyncZeroconf,
 )
 
-from hue_cli.errors import LinkButtonNotPressedError, NetworkError, NotFoundError, UsageError
+from hue_cli.errors import (
+    AuthError,
+    BridgeError,
+    LinkButtonNotPressedError,
+    NetworkError,
+    NotFoundError,
+    UsageError,
+)
 
 _LOG = logging.getLogger(__name__)
 
@@ -598,9 +605,25 @@ async def pair(
 async def fetch_schedules_raw(host: str, app_key: str) -> list[dict[str, Any]]:
     """Direct-aiohttp HTTPS GET against the bridge's /schedules endpoint (§4.5).
 
-    aiohue v1 has no schedules controller, so the wrapper falls back to a direct GET. Uses
-    HTTPS with self-signed-cert tolerance — the bridge presents a Signify-issued cert that
-    standard CA bundles do not trust.
+    aiohue v1 has no schedules controller, so the wrapper falls back to a direct GET.
+
+    TLS posture: we use ``ssl=False`` for the LAN-local request. This deviates from a
+    "match aiohue's TLS context" rule only in spelling — aiohue v1 itself does not
+    verify the bridge's Signify-issued certificate against the standard CA bundle
+    either. The bridge presents a per-device cert that public CAs do not chain to,
+    and the bridge is by definition LAN-local; the threat model already excludes
+    same-LAN MITM at the §4 transport level.
+
+    Response shape: a successful Hue v1 collection GET is a JSON object keyed by
+    resource id (``{"1": {...}, "2": {...}}``); error responses are a JSON list
+    of one or more ``{"error": {"type": int, "description": str, ...}}`` objects.
+    Some bridges return ``[]`` for an empty collection.
+
+    Error mapping per FR-58a / FR-59:
+
+    * type ``1``  (unauthorized user)  → :class:`AuthError`        (exit 2)
+    * type ``101`` (link button not pressed) → :class:`LinkButtonNotPressedError`
+    * any other  → :class:`BridgeError`                            (exit 1)
     """
 
     url = f"https://{host}/api/{app_key}/schedules"
@@ -611,20 +634,56 @@ async def fetch_schedules_raw(host: str, app_key: str) -> list[dict[str, Any]]:
     except aiohttp.ClientError as exc:
         raise NetworkError(f"schedules fetch failed against {host}: {exc!r}") from exc
 
-    if isinstance(data, dict):
-        # Bridge wraps single-error responses as {"error": {...}} or v1 array form.
-        raise NotFoundError(f"unexpected schedules response shape: {data!r}")
-    if not isinstance(data, list):
-        raise NotFoundError(f"unexpected schedules response: {data!r}")
-
     schedules: list[dict[str, Any]] = []
-    for entry in data:
-        if isinstance(entry, dict) and "error" in entry and isinstance(entry["error"], dict):
-            err = entry["error"]
-            raise NotFoundError(f"bridge rejected schedules query: {err.get('description', err)}")
-        if isinstance(entry, dict):
-            schedules.append(entry)
-    return schedules
+
+    if isinstance(data, list):
+        # v1 error envelope or already-normalized list (some test fixtures and
+        # legacy bridges).
+        for entry in data:
+            if isinstance(entry, dict) and "error" in entry and isinstance(entry["error"], dict):
+                _raise_for_v1_error(entry["error"])
+            if isinstance(entry, dict):
+                schedules.append(entry)
+        return schedules
+
+    if isinstance(data, dict):
+        # Bridge may wrap single-error responses as ``{"error": {...}}`` directly.
+        if "error" in data and isinstance(data["error"], dict):
+            _raise_for_v1_error(data["error"])
+        # Successful collection response: dict keyed by id. Tag each value with
+        # its key so downstream callers see the canonical id field.
+        for sched_id, body in data.items():
+            if not isinstance(body, dict):
+                continue
+            schedules.append({"id": sched_id, **body})
+        return schedules
+
+    raise BridgeError(f"unexpected schedules response: {data!r}")
+
+
+def _raise_for_v1_error(err: dict[str, Any]) -> None:
+    """Raise the appropriate hue-cli exception for a v1 error object.
+
+    Type ``1`` (unauthorized user) → :class:`AuthError`.
+    Type ``101`` (link button not pressed) → :class:`LinkButtonNotPressedError`.
+    Anything else → :class:`BridgeError`.
+    """
+
+    err_type = err.get("type")
+    description = err.get("description", "")
+    if err_type == 1:
+        raise AuthError(
+            f"bridge rejected request: {description or 'unauthorized user'}",
+            hint="Re-run hue-cli bridge pair to obtain a fresh app key.",
+        )
+    if err_type == 101:
+        raise LinkButtonNotPressedError(
+            f"bridge requires link-button press: {description or 'link button not pressed'}",
+            hint="Press the link button on the Hue bridge then retry.",
+        )
+    raise BridgeError(
+        f"bridge rejected request (type {err_type!r}): {description or err!r}",
+    )
 
 
 async def _discover_mdns(timeout: float) -> list[DiscoveredBridge]:
