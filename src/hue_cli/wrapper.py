@@ -27,7 +27,7 @@ from zeroconf.asyncio import (
     AsyncZeroconf,
 )
 
-from hue_cli.errors import LinkButtonNotPressedError, NetworkError, NotFoundError
+from hue_cli.errors import LinkButtonNotPressedError, NetworkError, NotFoundError, UsageError
 
 _LOG = logging.getLogger(__name__)
 
@@ -52,17 +52,37 @@ def normalize_id(wire_id: str) -> str:
 
 
 class HueWrapper:
-    """Async context manager wrapping ``aiohue.HueBridgeV1``."""
+    """The wrapper surface verbs program against (see ``_protocols.HueWrapperProto``).
+
+    Two usage shapes are supported:
+
+    * ``async with HueWrapper(host, key) as w:`` — long-lived connection; ``w`` is the wrapper
+      itself and ``w.bridge`` is the underlying ``aiohue.HueBridgeV1`` for advanced callers.
+    * ``await w.list_lights_records()`` (and siblings) without ``async with`` — each record
+      method auto-opens, materializes, and auto-closes the bridge connection.
+
+    Verbs use the second shape; the first is available for callers that issue several calls
+    against the same connection (Phase 3 batch).
+    """
 
     def __init__(self, host: str, app_key: str) -> None:
         self.host = host
         self.app_key = app_key
         self._bridge: Any | None = None
+        self._owns_connection = False
 
-    async def __aenter__(self) -> Any:
-        self._bridge = aiohue.HueBridgeV1(self.host, self.app_key)
-        await self._bridge.initialize()
+    @property
+    def bridge(self) -> Any:
+        if self._bridge is None:
+            raise RuntimeError(
+                "HueWrapper not connected; use 'async with' or call methods directly"
+            )
         return self._bridge
+
+    async def __aenter__(self) -> HueWrapper:
+        await self._open()
+        self._owns_connection = True
+        return self
 
     async def __aexit__(
         self,
@@ -70,9 +90,367 @@ class HueWrapper:
         exc: BaseException | None,
         tb: TracebackType | None,
     ) -> None:
+        await self._close()
+        self._owns_connection = False
+
+    async def _open(self) -> None:
+        if self._bridge is not None:
+            return
+        self._bridge = aiohue.HueBridgeV1(self.host, self.app_key)
+        await self._bridge.initialize()
+
+    async def _close(self) -> None:
         if self._bridge is not None:
             await self._bridge.close()
             self._bridge = None
+
+    async def _ensure(self) -> Any:
+        """Open a transient connection if needed; return the live bridge object."""
+        if self._bridge is None:
+            await self._open()
+        return self._bridge
+
+    async def _maybe_close(self) -> None:
+        """Close a transient connection (no-op if owned by an active ``async with``)."""
+        if not self._owns_connection:
+            await self._close()
+
+    # --- Record materialization (FR-11..21) ---------------------------------
+
+    async def list_lights_records(self) -> list[dict[str, Any]]:
+        """Return §10.2 Light records as dicts. Auto-connects if needed."""
+        bridge = await self._ensure()
+        try:
+            return [_light_to_record(light) for light in bridge.lights.values()]
+        finally:
+            await self._maybe_close()
+
+    async def list_groups_records(self) -> list[dict[str, Any]]:
+        """Return §10.3 Group records (Rooms + Zones). Auto-connects if needed."""
+        bridge = await self._ensure()
+        try:
+            return [_group_to_record(group) for group in bridge.groups.values()]
+        finally:
+            await self._maybe_close()
+
+    async def list_scenes_records(self) -> list[dict[str, Any]]:
+        """Return §10.4 Scene records. Auto-connects if needed."""
+        bridge = await self._ensure()
+        try:
+            valid_group_ids = {gid for gid in bridge.groups}
+            return [_scene_to_record(scene, valid_group_ids) for scene in bridge.scenes.values()]
+        finally:
+            await self._maybe_close()
+
+    async def list_sensors_records(self) -> list[dict[str, Any]]:
+        """Return §10.5 Sensor records. Auto-connects if needed."""
+        bridge = await self._ensure()
+        try:
+            return [_sensor_to_record(sensor) for sensor in bridge.sensors.values()]
+        finally:
+            await self._maybe_close()
+
+    async def list_schedules_records(self) -> list[dict[str, Any]]:
+        """Return §10.7 Schedule records via the §4.5 direct-aiohttp HTTPS fallback."""
+        raw = await fetch_schedules_raw(self.host, self.app_key)
+        return [_schedule_to_record(entry) for entry in raw]
+
+    async def get_bridge_record(self) -> dict[str, Any]:
+        """Return the §10.1 Bridge record. Auto-connects if needed."""
+        bridge = await self._ensure()
+        try:
+            return _bridge_to_record(bridge)
+        finally:
+            await self._maybe_close()
+
+    async def resolve_target(self, target: str) -> dict[str, Any]:
+        """Resolve ``target`` per FR-19 precedence and return ``{kind, record, object}``.
+
+        Precedence: ``@room:``/``@zone:`` prefix → ``@<name>`` (group) → light name/id →
+        scene name/id → sensor name/id → bridge alias literal ``bridge``.
+        """
+        bridge = await self._ensure()
+        try:
+            return self._resolve_target_unlocked(bridge, target)
+        finally:
+            await self._maybe_close()
+
+    def _resolve_target_unlocked(self, bridge: Any, target: str) -> dict[str, Any]:
+        if target == "bridge":
+            return {"kind": "bridge", "record": _bridge_to_record(bridge), "object": None}
+
+        if target.startswith("@"):
+            return self._resolve_group_target(bridge, target)
+
+        for light in bridge.lights.values():
+            if _matches(light, target):
+                return {"kind": "light", "record": _light_to_record(light), "object": light}
+
+        for scene in bridge.scenes.values():
+            if _matches(scene, target):
+                valid = {gid for gid in bridge.groups}
+                return {
+                    "kind": "scene",
+                    "record": _scene_to_record(scene, valid),
+                    "object": scene,
+                }
+
+        for sensor in bridge.sensors.values():
+            if _matches(sensor, target):
+                return {
+                    "kind": "sensor",
+                    "record": _sensor_to_record(sensor),
+                    "object": sensor,
+                }
+
+        raise NotFoundError(f"target {target!r} not found on bridge")
+
+    def _resolve_group_target(self, bridge: Any, target: str) -> dict[str, Any]:
+        body = target[1:]
+        constraint: str | None = None
+        if ":" in body:
+            prefix, _, body = body.partition(":")
+            if prefix.lower() in {"room", "zone"}:
+                constraint = prefix.capitalize()
+
+        candidates: list[Any] = []
+        for group in bridge.groups.values():
+            gtype = getattr(group, "type", None)
+            if constraint is not None and gtype != constraint:
+                continue
+            if gtype not in ("Room", "Zone"):
+                continue
+            if _eq_ci(getattr(group, "name", ""), body):
+                candidates.append(group)
+
+        if not candidates:
+            raise NotFoundError(f"group {target!r} not found on bridge")
+        if len(candidates) > 1:
+            ids = ", ".join(
+                f"{getattr(g, 'id', '?')}({getattr(g, 'type', '?')})" for g in candidates
+            )
+            raise UsageError(
+                f"group {target!r} is ambiguous; disambiguate with @room:/@zone: ({ids})"
+            )
+
+        group = candidates[0]
+        kind = "room" if getattr(group, "type", None) == "Room" else "zone"
+        return {"kind": kind, "record": _group_to_record(group), "object": group}
+
+    async def light_set_on(self, light: Any, on: bool) -> None:
+        """Power-set a light (FR-22/23 dispatch helper)."""
+        await self._ensure()
+        try:
+            await light.set_state(on=on)
+        finally:
+            await self._maybe_close()
+
+    async def group_set_on(self, group: Any, on: bool) -> None:
+        """Power-set a group (FR-22/23 dispatch helper)."""
+        await self._ensure()
+        try:
+            await group.set_action(on=on)
+        finally:
+            await self._maybe_close()
+
+    async def get_all_lights_group(self) -> Any:
+        """Return the special Group 0 (all-lights) for the literal ``all`` target (FR-22)."""
+        bridge = await self._ensure()
+        try:
+            return await bridge.groups.get_all_lights_group()
+        finally:
+            await self._maybe_close()
+
+
+def _eq_ci(a: str, b: str) -> bool:
+    return a.casefold() == b.casefold()
+
+
+def _matches(obj: Any, target: str) -> bool:
+    """True if ``target`` equals the object's id or matches its name case-insensitively."""
+    if str(getattr(obj, "id", "")) == target:
+        return True
+    return _eq_ci(getattr(obj, "name", ""), target)
+
+
+def _safe(obj: Any, attr: str, default: Any = None) -> Any:
+    """Best-effort getattr that swallows ``AiohueException`` style errors."""
+    try:
+        return getattr(obj, attr, default)
+    except Exception:
+        return default
+
+
+def _bri_to_percent(bri: Any) -> int | None:
+    """Translate raw 1-254 brightness to 0-100 percent (FR-11)."""
+    if bri is None:
+        return None
+    try:
+        b = int(bri)
+    except (TypeError, ValueError):
+        return None
+    if b <= 1:
+        return 0
+    if b >= 254:
+        return 100
+    return round((b - 1) / 253 * 100)
+
+
+def _light_to_record(light: Any) -> dict[str, Any]:
+    state_obj = _safe(light, "state")
+    state: dict[str, Any] = {}
+    if state_obj is not None:
+        bri = _safe(state_obj, "bri")
+        state = {
+            "on": bool(_safe(state_obj, "on", False)),
+            "reachable": bool(_safe(state_obj, "reachable", False)),
+            "brightness": int(bri) if isinstance(bri, int) else None,
+            "brightness_percent": _bri_to_percent(bri),
+            "color_mode": _safe(state_obj, "colormode"),
+            "xy": _safe(state_obj, "xy"),
+            "ct_mireds": _safe(state_obj, "ct"),
+            "hue": _safe(state_obj, "hue"),
+            "sat": _safe(state_obj, "sat"),
+            "effect": _safe(state_obj, "effect", "none"),
+            "alert": _safe(state_obj, "alert", "none"),
+        }
+
+    capabilities_obj = _safe(light, "controlcapabilities") or {}
+    if isinstance(capabilities_obj, dict):
+        ct = capabilities_obj.get("ct") or {}
+        gamut = capabilities_obj.get("colorgamut")
+        gamut_type = capabilities_obj.get("colorgamuttype")
+    else:
+        ct, gamut, gamut_type = {}, None, None
+
+    return {
+        "id": str(_safe(light, "id", "")),
+        "name": _safe(light, "name", ""),
+        "model_id": _safe(light, "modelid"),
+        "product_name": _safe(light, "productname"),
+        "type": _safe(light, "type"),
+        "manufacturer_name": _safe(light, "manufacturername"),
+        "swversion": _safe(light, "swversion"),
+        "unique_id": _safe(light, "uniqueid"),
+        "state": state,
+        "control_capabilities": {
+            "ct_min_mireds": ct.get("min") if isinstance(ct, dict) else None,
+            "ct_max_mireds": ct.get("max") if isinstance(ct, dict) else None,
+            "color_gamut": gamut,
+            "color_gamut_type": gamut_type,
+        },
+    }
+
+
+def _group_to_record(group: Any) -> dict[str, Any]:
+    state_obj = _safe(group, "state") or {}
+    if isinstance(state_obj, dict):
+        any_on = bool(state_obj.get("any_on", False))
+        all_on = bool(state_obj.get("all_on", False))
+    else:
+        any_on = bool(_safe(state_obj, "any_on", False))
+        all_on = bool(_safe(state_obj, "all_on", False))
+    light_ids = _safe(group, "lights") or []
+    sensor_ids = _safe(group, "sensors") or []
+    return {
+        "id": str(_safe(group, "id", "")),
+        "type": _safe(group, "type"),
+        "class": _safe(group, "class_") or _safe(group, "klass"),
+        "name": _safe(group, "name", ""),
+        "light_ids": [str(x) for x in light_ids],
+        "sensor_ids": [str(x) for x in sensor_ids],
+        "state": {"any_on": any_on, "all_on": all_on},
+    }
+
+
+def _scene_to_record(scene: Any, valid_group_ids: set[str]) -> dict[str, Any]:
+    raw_group_id = _safe(scene, "group")
+    group_id = str(raw_group_id) if raw_group_id is not None else None
+    stale = group_id is not None and group_id not in {str(x) for x in valid_group_ids}
+    if stale:
+        group_id = None
+    light_ids = _safe(scene, "lights") or []
+    return {
+        "id": str(_safe(scene, "id", "")),
+        "name": _safe(scene, "name", ""),
+        "group_id": group_id,
+        "light_ids": [str(x) for x in light_ids],
+        "last_updated": _safe(scene, "lastupdated"),
+        "recycle": bool(_safe(scene, "recycle", False)),
+        "locked": bool(_safe(scene, "locked", False)),
+        "stale": stale,
+    }
+
+
+def _sensor_to_record(sensor: Any) -> dict[str, Any]:
+    state_obj = _safe(sensor, "state") or {}
+    config_obj = _safe(sensor, "config") or {}
+    if not isinstance(state_obj, dict):
+        state_obj = {}
+    if not isinstance(config_obj, dict):
+        config_obj = {}
+    return {
+        "id": str(_safe(sensor, "id", "")),
+        "name": _safe(sensor, "name", ""),
+        "type": _safe(sensor, "type"),
+        "model_id": _safe(sensor, "modelid"),
+        "unique_id": _safe(sensor, "uniqueid"),
+        "state": state_obj,
+        "config": config_obj,
+    }
+
+
+def _schedule_to_record(raw: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(raw.get("id", "")),
+        "name": raw.get("name", ""),
+        "description": raw.get("description", ""),
+        "command": raw.get("command", {}),
+        "localtime": raw.get("localtime", raw.get("time", "")),
+        "status": raw.get("status", ""),
+        "autodelete": bool(raw.get("autodelete", False)),
+        "created": raw.get("created"),
+        "starttime": raw.get("starttime"),
+    }
+
+
+def _bridge_to_record(bridge: Any) -> dict[str, Any]:
+    config = _safe(bridge, "config")
+    if config is None:
+        return {}
+    raw_id = _safe(config, "bridgeid") or _safe(config, "bridge_id") or ""
+    bid = normalize_id(str(raw_id)) if raw_id else ""
+    whitelist_raw = _safe(config, "whitelist") or {}
+    whitelist: list[dict[str, Any]] = []
+    if isinstance(whitelist_raw, dict):
+        for key, entry in whitelist_raw.items():
+            if not isinstance(entry, dict):
+                continue
+            whitelist.append(
+                {
+                    "id": key,
+                    "name": entry.get("name", ""),
+                    "last_use_date": entry.get("last use date") or entry.get("last_use_date"),
+                    "create_date": entry.get("create date") or entry.get("create_date"),
+                }
+            )
+    return {
+        "id": bid,
+        "name": _safe(config, "name", ""),
+        "host": _safe(config, "ipaddress") or _safe(config, "ip", ""),
+        "mac": _safe(config, "mac", ""),
+        "model_id": _safe(config, "modelid"),
+        "api_version": _safe(config, "apiversion"),
+        "swversion": _safe(config, "swversion"),
+        "supports_v2": bool(_safe(config, "supports_v2", False)),
+        "paired_at": None,
+        "reachable": True,
+        "gateway": _safe(config, "gateway"),
+        "netmask": _safe(config, "netmask"),
+        "timezone": _safe(config, "timezone"),
+        "zigbee_channel": _safe(config, "zigbeechannel"),
+        "whitelist": whitelist,
+    }
 
 
 async def discover(

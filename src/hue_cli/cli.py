@@ -142,10 +142,54 @@ def main(
     ctx.obj["no_probe"] = no_probe
     ctx.obj["verbose"] = verbose
 
-    # Engineer A populates ``ctx.obj["wrapper"]`` and ``ctx.obj["config"]``
-    # via the top-level callback once their modules land. During parallel
-    # dev they are absent, and tests inject them directly via ``runner.invoke
-    # (..., obj={"wrapper": fake})``.
+    # Tests inject a fake wrapper directly via ``runner.invoke(..., obj={"wrapper": fake})``;
+    # for those invocations ``ctx.obj["wrapper"]`` is already populated and we leave it alone.
+    # Otherwise, build a real ``HueWrapper`` from credentials when available so verbs that
+    # need a connected bridge can find one in ``ctx.obj["wrapper"]``.
+    if "wrapper" not in ctx.obj:
+        ctx.obj["wrapper"] = _resolve_wrapper(bridge_alias, bridge_ip, app_key)
+
+
+def _resolve_wrapper(
+    bridge_alias: str | None,
+    bridge_ip: str | None,
+    app_key: str | None,
+) -> object | None:
+    """Return a ``HueWrapper`` if credentials are available, else ``None``.
+
+    Resolution: ``--bridge-ip`` + ``--app-key`` overrides everything; otherwise consult the
+    credentials store for ``--bridge`` (if given) or the single-paired-bridge default.
+    Verbs that don't need a bridge (``bridge discover``, ``bridge pair``, ``--help``, etc.)
+    tolerate ``None`` and short-circuit on their own.
+    """
+    try:
+        from hue_cli import credentials
+        from hue_cli.wrapper import HueWrapper
+    except ImportError:
+        return None
+
+    if bridge_ip is not None and app_key is not None:
+        return HueWrapper(bridge_ip, app_key)
+
+    try:
+        store = credentials.load()
+    except Exception:
+        return None
+
+    if not store.bridges:
+        return None
+
+    if bridge_alias is not None:
+        creds = store.bridges.get(bridge_alias)
+        if creds is None:
+            return None
+        return HueWrapper(creds.host, creds.app_key)
+
+    if len(store.bridges) == 1:
+        creds = next(iter(store.bridges.values()))
+        return HueWrapper(creds.host, creds.app_key)
+
+    return None
 
 
 # --- Verb registration -------------------------------------------------------
