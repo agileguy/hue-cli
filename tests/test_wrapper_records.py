@@ -13,7 +13,9 @@ materialization helpers against aiohue-shaped fakes.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
+from unittest.mock import patch
 
 from hue_cli import wrapper as wrapper_mod
 
@@ -376,3 +378,126 @@ def test_bridge_record_reads_network_fields_from_raw() -> None:
     # supports_v2 is a discovery-time capability, not present on Config —
     # we surface ``None`` rather than silently faking a default of False.
     assert record["supports_v2"] is None
+
+
+# ---------------------------------------------------------------------------
+# apply_scene wrapper-level coverage (FR-39 legacy LightScene fallback)
+# ---------------------------------------------------------------------------
+
+
+class _RecordingGroupFake:
+    """Captures every ``set_action`` call so the test can assert on kwargs.
+
+    Mirrors what the bridge's all-lights group exposes from aiohue: an awaitable
+    ``set_action(**kwargs)`` and an ``id`` attribute. We record the kwargs
+    verbatim so the test can verify the verb forwarded ``scene=<id>`` (and any
+    ``transitiontime``) without the wrapper accidentally dropping a field.
+    """
+
+    def __init__(self, group_id: str = "0") -> None:
+        self.id = group_id
+        self.set_action_calls: list[dict[str, Any]] = []
+
+    async def set_action(self, **kwargs: Any) -> None:
+        self.set_action_calls.append(kwargs)
+
+
+class _GroupsFake:
+    """Stand-in for ``bridge.groups`` — a Mapping plus ``get_all_lights_group``.
+
+    aiohue exposes ``bridge.groups`` as both a dict-like (``bridge.groups[id]``)
+    and an awaitable factory (``await bridge.groups.get_all_lights_group()``);
+    this fake mirrors both shapes so the wrapper's apply_scene branch can be
+    exercised without spinning up a real bridge.
+    """
+
+    def __init__(self, all_lights_group: _RecordingGroupFake) -> None:
+        self._all_lights_group = all_lights_group
+        self._by_id: dict[str, _RecordingGroupFake] = {}
+
+    def __getitem__(self, group_id: str) -> _RecordingGroupFake:
+        if group_id not in self._by_id:
+            self._by_id[group_id] = _RecordingGroupFake(group_id)
+        return self._by_id[group_id]
+
+    def __iter__(self) -> Any:
+        return iter(self._by_id)
+
+    async def get_all_lights_group(self) -> _RecordingGroupFake:
+        return self._all_lights_group
+
+
+class _ApplySceneBridgeFake:
+    """Minimal bridge with a ``groups`` attribute and a no-op ``close``."""
+
+    def __init__(self, all_lights_group: _RecordingGroupFake) -> None:
+        self.groups = _GroupsFake(all_lights_group)
+
+    async def initialize(self) -> None:  # pragma: no cover - never invoked here
+        return None
+
+    async def close(self) -> None:
+        return None
+
+
+def test_apply_scene_legacy_lightscene_falls_back_to_all_lights_group() -> None:
+    """FR-39 fallback: ``group_id=None`` triggers the all-lights group recall.
+
+    When a legacy ``LightScene`` (no group association) is applied, the wrapper
+    must call ``bridge.groups.get_all_lights_group()`` and dispatch the recall
+    against group 0 — the bridge then filters the recall to only the scene's
+    ``lights`` array. This test pins that behavior at the wrapper layer so a
+    refactor that drops the fallback (or accidentally routes through a named
+    group) gets caught before the integration suite.
+    """
+
+    all_lights = _RecordingGroupFake(group_id="0")
+    fake_bridge = _ApplySceneBridgeFake(all_lights)
+
+    wrapper = wrapper_mod.HueWrapper("192.0.2.1", "fake-app-key")
+
+    # Patch ``aiohue.HueBridgeV1`` so ``_open`` returns our recording fake instead
+    # of trying to talk to a real bridge. Initialize is a no-op on the fake.
+    with patch("hue_cli.wrapper.aiohue.HueBridgeV1", return_value=fake_bridge):
+        asyncio.run(
+            wrapper.apply_scene(
+                scene_id="legacyScene01",
+                group_id=None,
+                transitiontime=None,
+            )
+        )
+
+    # All-lights group is the dispatch target.
+    assert all_lights.set_action_calls == [{"scene": "legacyScene01"}]
+    # No named group should have been dispatched.
+    assert fake_bridge.groups._by_id == {}
+
+
+def test_apply_scene_modern_groupscene_targets_named_group() -> None:
+    """FR-39 modern path: ``group_id="3"`` dispatches via the named group.
+
+    Companion to the legacy-fallback test — confirms the wrapper does NOT route
+    through ``get_all_lights_group()`` when the scene has a real group_id, and
+    forwards ``transitiontime`` when the verb passes one through.
+    """
+
+    all_lights = _RecordingGroupFake(group_id="0")
+    fake_bridge = _ApplySceneBridgeFake(all_lights)
+
+    wrapper = wrapper_mod.HueWrapper("192.0.2.1", "fake-app-key")
+
+    with patch("hue_cli.wrapper.aiohue.HueBridgeV1", return_value=fake_bridge):
+        asyncio.run(
+            wrapper.apply_scene(
+                scene_id="modernScene42",
+                group_id="3",
+                transitiontime=20,
+            )
+        )
+
+    # Named group dispatched, not all-lights.
+    assert all_lights.set_action_calls == []
+    assert "3" in fake_bridge.groups._by_id
+    assert fake_bridge.groups["3"].set_action_calls == [
+        {"scene": "modernScene42", "transitiontime": 20}
+    ]
