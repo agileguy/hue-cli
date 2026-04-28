@@ -29,9 +29,10 @@ throughput bound by aiohue / wrapper concurrency, not by Click overhead.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import shlex
 import sys
-import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -130,6 +131,13 @@ def _parse_batch_line(raw_line: str) -> ParsedLine | None:
     Skip rules per FR-54b:
         * empty / whitespace-only → ``None``
         * leading ``#``           → ``None`` (comment)
+
+    Only **leading** ``#`` is treated as a comment marker. An inline ``#``
+    (e.g., ``on @kitchen # set after dinner``) is passed through to
+    ``shlex.split`` and will be tokenised into the verb's arg list, which
+    typically surfaces as a :class:`UsageError` (unknown verb / unknown
+    flag). Operators wanting trailing notes should put them on their own
+    ``#``-prefixed line.
 
     A line that fails parsing returns a :class:`ParsedLine` with ``error``
     set (a :class:`UsageError`) — the dispatch loop emits one failed-result
@@ -420,20 +428,120 @@ def _result_record(parsed: ParsedLine, task: TaskResult) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+_DRAIN_TIMEOUT_SECONDS = 2.0
+
+
+async def _wait_with_cancel(
+    tasks: list[asyncio.Task[TaskResult]],
+    cancel_event: asyncio.Event | None,
+    *,
+    on_done: Callable[[int, asyncio.Task[TaskResult]], None] | None = None,
+    drain_timeout: float = _DRAIN_TIMEOUT_SECONDS,
+) -> tuple[set[asyncio.Task[TaskResult]], set[asyncio.Task[TaskResult]]]:
+    """Wait for all ``tasks`` while watching ``cancel_event``.
+
+    Behaviour:
+
+    * If ``cancel_event`` is ``None`` or never fires, this returns once
+      every task is complete — equivalent to ``asyncio.gather`` semantics
+      (without the per-task exception unwrapping).
+    * If ``cancel_event`` fires while tasks are still running, in-flight
+      tasks get up to ``drain_timeout`` seconds to finish naturally; any
+      task still running after that is cancelled and reaped (so aiohttp's
+      ``ClientSession`` ResourceWarning doesn't fire). FR-54c §5.11.
+
+    ``on_done`` (when supplied) is invoked once per task as it completes,
+    receiving its original index in ``tasks`` and the task itself. This is
+    how the batch verb streams per-line JSONL records to stdout — so a
+    SIGINT mid-batch leaves a faithful partial transcript on stdout, not
+    just an "interrupted" summary line.
+
+    Returns ``(done, pending)`` sets matching :func:`asyncio.wait`.
+    """
+    pending: set[asyncio.Task[TaskResult]] = set(tasks)
+    done: set[asyncio.Task[TaskResult]] = set()
+    task_to_index = {task: idx for idx, task in enumerate(tasks)}
+
+    def _record_finished(finished: set[asyncio.Task[TaskResult]]) -> None:
+        for task in finished:
+            if task in pending:
+                pending.discard(task)
+                done.add(task)
+                if on_done is not None:
+                    on_done(task_to_index[task], task)
+
+    while pending:
+        if cancel_event is not None and cancel_event.is_set():
+            break
+
+        wait_targets: list[asyncio.Task[Any]] = list(pending)
+        cancel_waiter: asyncio.Task[Any] | None = None
+        if cancel_event is not None:
+            cancel_waiter = asyncio.create_task(cancel_event.wait())
+            wait_targets.append(cancel_waiter)
+
+        try:
+            finished, _ = await asyncio.wait(wait_targets, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            if cancel_waiter is not None and not cancel_waiter.done():
+                cancel_waiter.cancel()
+                # Reap to suppress "Task was destroyed but it is pending!".
+                with contextlib.suppress(asyncio.CancelledError):
+                    await cancel_waiter
+
+        # Pull out only the real-task completions; the cancel waiter (if it
+        # fired) is intentionally NOT recorded in `done`.
+        real_finished = {task for task in finished if task is not cancel_waiter and task in pending}
+        _record_finished(real_finished)
+
+    if cancel_event is not None and cancel_event.is_set() and pending:
+        # FR-54c (2): give in-flight tasks up to drain_timeout seconds.
+        drain_done, _drain_pending = await asyncio.wait(pending, timeout=drain_timeout)
+        _record_finished(drain_done)
+
+        # Anything still running after the drain budget gets force-cancelled.
+        # Reap the cancellations so aiohttp's ClientSession doesn't emit a
+        # ResourceWarning at GC time.
+        if pending:
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    return done, pending
+
+
 async def _run_batch(
     wrapper: HueWrapperProto,
     parsed_lines: list[ParsedLine],
     *,
     concurrency: int,
     session: BatchSession,
+    on_result: Callable[[int, ParsedLine, TaskResult], None] | None = None,
 ) -> list[tuple[ParsedLine, TaskResult]]:
-    """Dispatch all parsed lines under a semaphore, honoring ``session.cancel_event``.
+    """Dispatch all parsed lines under a semaphore, honouring ``session.cancel_event``.
 
-    Returns the list of ``(parsed, TaskResult)`` pairs in **input order**.
-    On a cancel-event trigger the dispatcher stops scheduling new ops; we
-    wait up to 2 seconds for the in-flight set to finish, then return what
-    we have. Any line never dispatched is omitted from the returned list
-    (its line is reflected in ``session.pending``).
+    Returns the list of ``(parsed, TaskResult)`` pairs in **input order**,
+    skipping any input line that never produced a result (a queued task
+    cancelled by the drain budget, or a line never scheduled because the
+    cancel landed before its `create_task`). The skipped count is
+    reflected in ``session.pending``; ``session.completed`` is the length
+    of the returned list.
+
+    On a cancel-event trigger:
+
+        1. The dispatcher stops scheduling new ops on the next yield.
+        2. ``_wait_with_cancel`` gives in-flight tasks up to 2 s to finish
+           (FR-54c §5.11). Anything still running is force-cancelled and
+           reaped.
+        3. If ``on_result`` is supplied, completed tasks have already been
+           streamed to it as they finished — so on cancel the operator
+           sees a faithful JSONL transcript of what landed before SIGINT,
+           not just the summary line.
+
+    The whole loop runs inside a single ``async with wrapper:`` so all
+    per-line verbs share one TLS connection (FR-53 throughput). The
+    wrapper is depth-counted so per-verb ``async with wrapper:`` blocks
+    inside the dispatch path become true no-ops.
     """
     bound = max(1, concurrency)
     sem = asyncio.Semaphore(bound)
@@ -443,38 +551,48 @@ async def _run_batch(
             target_label = parsed.target or parsed.verb
             return await timed_run(target_label, _dispatch_parsed_line(wrapper, parsed))
 
-    tasks: list[asyncio.Task[TaskResult]] = []
-    for parsed in parsed_lines:
-        if session.cancel_event is not None and session.cancel_event.is_set():
-            break
-        tasks.append(asyncio.create_task(_one(parsed)))
+    results: list[TaskResult | None] = [None] * len(parsed_lines)
 
-    session.pending = len(parsed_lines) - len(tasks)
+    def _on_task_done(idx: int, task: asyncio.Task[TaskResult]) -> None:
+        # Reap the result and stream it to the caller's per-line callback.
+        # ``task`` is in ``done``, so ``.result()`` is safe.
+        try:
+            value = task.result()
+        except (asyncio.CancelledError, Exception):  # pragma: no cover — defensive
+            return
+        results[idx] = value
+        if on_result is not None:
+            on_result(idx, parsed_lines[idx], value)
 
-    if session.cancel_event is not None and session.cancel_event.is_set():
-        # Drain whatever is in flight up to 2 s, then move on. ``asyncio.wait``
-        # rejects an empty task-set, so short-circuit when the cancel landed
-        # before any task could be created.
+    async with wrapper:
+        tasks: list[asyncio.Task[TaskResult]] = []
+        for parsed in parsed_lines:
+            if session.cancel_event is not None and session.cancel_event.is_set():
+                break
+            tasks.append(asyncio.create_task(_one(parsed)))
+            # Yield to the event loop so the signal handler can land
+            # ``cancel_event.set()`` mid-dispatch. Without this, a 1000-line
+            # batch creates all 1000 tasks before the loop ever yields, and
+            # the in-loop ``cancel_event.is_set()`` check above is dead code.
+            await asyncio.sleep(0)
+
         if not tasks:
             session.completed = 0
+            session.pending = len(parsed_lines)
             return []
-        done, pending = await asyncio.wait(tasks, timeout=2.0)
-        session.completed = len(done)
-        session.pending += len(pending)
-        for task in pending:
-            task.cancel()
-        results: list[tuple[ParsedLine, TaskResult]] = []
-        for parsed, task in zip(parsed_lines[: len(tasks)], tasks, strict=False):
-            if task in done:
-                results.append((parsed, task.result()))
-        return results
 
-    if not tasks:
-        session.completed = 0
-        return []
-    raw_results = await asyncio.gather(*tasks)
-    session.completed = len(raw_results)
-    return list(zip(parsed_lines, raw_results, strict=True))
+        await _wait_with_cancel(
+            tasks,
+            session.cancel_event,
+            on_done=_on_task_done,
+        )
+
+    pairs: list[tuple[ParsedLine, TaskResult]] = [
+        (parsed_lines[idx], result) for idx, result in enumerate(results) if result is not None
+    ]
+    session.completed = len(pairs)
+    session.pending = len(parsed_lines) - len(pairs)
+    return pairs
 
 
 # ---------------------------------------------------------------------------
@@ -581,16 +699,44 @@ def batch_cmd(
 
     from hue_cli.cli import _run_async_graceful
 
-    started = time.perf_counter()
+    # JSONL streaming: emit each record on stdout the instant its task
+    # finishes (completion-order, not input-order). Streaming matters
+    # because a SIGINT mid-batch causes ``_run_async_graceful`` to call
+    # ``_emit_interrupted_summary`` and ``sys.exit`` — the verb's
+    # post-await code never runs on cancel, so any records buffered
+    # in-process would be lost. Records that landed before the interrupt
+    # are already on stdout; the summary line follows them.
+    #
+    # TEXT and JSON modes batch-emit after the run completes: TEXT because
+    # human readers expect a single coherent block, JSON because pretty-array
+    # framing can't be streamed line-by-line. Both paths are unreachable on
+    # cancel (sys.exit fires inside the graceful runner), which is the
+    # documented limitation for those modes.
+    on_result: Callable[[int, ParsedLine, TaskResult], None] | None = None
+    if fmt is OutputFormat.JSONL:
+
+        def _stream_jsonl(_idx: int, parsed: ParsedLine, task: TaskResult) -> None:
+            record = _result_record(parsed, task)
+            line = emit_batch_result(record, fmt)
+            if line:
+                click.echo(line)
+
+        on_result = _stream_jsonl
+
     pairs = _run_async_graceful(
-        _run_batch(wrapper, parsed_lines, concurrency=concurrency, session=session),
+        _run_batch(
+            wrapper,
+            parsed_lines,
+            concurrency=concurrency,
+            session=session,
+            on_result=on_result,
+        ),
         session=session,
     )
-    elapsed_ms = (time.perf_counter() - started) * 1000.0
-    _ = elapsed_ms  # reserved for future per-batch summary
 
-    # Emit each result.
-    _emit_results(pairs, fmt)
+    # Emit results for non-streaming formats. JSONL already streamed above.
+    if fmt is not OutputFormat.JSONL:
+        _emit_results(pairs, fmt)
 
     # Exit code follows §11.1.
     code = aggregate_exit_code([t for _, t in pairs])
@@ -612,8 +758,6 @@ def _resolve_concurrency(obj: dict[str, Any]) -> int:
 
     # Best-effort config read; failures fall back to 5.
     try:
-        from pathlib import Path
-
         from hue_cli.config import load_config
 
         cfg_path = obj.get("config_path") if isinstance(obj, dict) else None
