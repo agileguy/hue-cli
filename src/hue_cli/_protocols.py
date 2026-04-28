@@ -23,7 +23,14 @@ from typing import Any, Protocol
 
 
 class LightProto(Protocol):
-    """Subset of aiohue's ``Light`` model the verbs touch."""
+    """Subset of aiohue's ``Light`` model the verbs touch.
+
+    The ``set_state`` signature covers every wire field the Phase 2 ``set``
+    verb forwards (brightness, color temp, color in xy/hue/sat, effect,
+    alert, transition). Protocols are structural — the concrete
+    ``aiohue.Light.set_state`` accepts these kwargs already; we just declare
+    them here so mypy can type-check the verb's call sites.
+    """
 
     id: str
     name: str
@@ -33,12 +40,22 @@ class LightProto(Protocol):
         *,
         on: bool | None = ...,
         bri: int | None = ...,
+        ct: int | None = ...,
+        xy: tuple[float, float] | None = ...,
+        hue: int | None = ...,
+        sat: int | None = ...,
+        effect: str | None = ...,
+        alert: str | None = ...,
         transitiontime: int | None = ...,
     ) -> None: ...
 
 
 class GroupProto(Protocol):
-    """Subset of aiohue's ``Group`` model the verbs touch."""
+    """Subset of aiohue's ``Group`` model the verbs touch.
+
+    Same kwargs as :class:`LightProto.set_state` plus ``scene`` (only valid
+    on group dispatch — Hue v1 scene-recall is a group-level operation).
+    """
 
     id: str
     name: str
@@ -48,6 +65,12 @@ class GroupProto(Protocol):
         *,
         on: bool | None = ...,
         bri: int | None = ...,
+        ct: int | None = ...,
+        xy: tuple[float, float] | None = ...,
+        hue: int | None = ...,
+        sat: int | None = ...,
+        effect: str | None = ...,
+        alert: str | None = ...,
         scene: str | None = ...,
         transitiontime: int | None = ...,
     ) -> None: ...
@@ -99,8 +122,39 @@ class HueWrapperProto(Protocol):
     async def group_set_on(self, group: GroupProto, on: bool) -> None:
         """Helper for ``on``/``off``/``toggle`` verb dispatch on a group."""
 
+    async def light_set_state(self, light: LightProto, **state: Any) -> None:
+        """Helper for ``set`` verb dispatch on a light (FR-22 / FR-27..38).
+
+        Thin pass-through to ``light.set_state(**state)``. Lives on the
+        wrapper rather than as a direct call so test fakes can record the
+        kwargs without monkey-patching the underlying object, and so the
+        wrapper retains the option to attach throttling / retries here later.
+        """
+
+    async def group_set_action(self, group: GroupProto, **action: Any) -> None:
+        """Helper for ``set`` verb dispatch on a group / 'all' (FR-22).
+
+        Same shape as :meth:`light_set_state` but for ``Group.set_action``.
+        """
+
     async def get_all_lights_group(self) -> GroupProto:
         """Return the special Group 0 (all lights) for ``all`` target."""
+
+    async def apply_scene(
+        self,
+        scene_id: str,
+        group_id: str | None,
+        *,
+        transitiontime: int | None,
+    ) -> None:
+        """Apply ``scene_id`` (FR-39).
+
+        For modern ``GroupScene`` entries pass the scene's ``group_id``; the
+        wrapper routes to ``bridge.groups[group_id].set_action(scene=...)``.
+        For legacy ``LightScene`` entries with no group, pass ``group_id=None``
+        and the wrapper falls back to the all-lights group recall.
+        ``transitiontime`` is in deciseconds (caller does the ms->ds round).
+        """
 
     async def __aenter__(self) -> HueWrapperProto:
         """Open the underlying bridge connection for the ``async with`` block.
