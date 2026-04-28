@@ -332,6 +332,16 @@ class HueWrapper:
             if transitiontime is not None:
                 kwargs["transitiontime"] = transitiontime
             if group_id is None:
+                # Legacy LightScene path. Surface a WARNING so ``-v`` operators
+                # can distinguish a modern GroupScene apply from the all-lights
+                # fallback that targets every reachable bulb (the bridge filters
+                # the recall to the scene's ``lights`` array, but the dispatch
+                # is still group-0). Behavior unchanged — this is observability.
+                _LOG.warning(
+                    "scene %s applied via all-lights fallback (legacy LightScene); "
+                    "verify lights changed",
+                    scene_id,
+                )
                 group = await bridge.groups.get_all_lights_group()
                 await group.set_action(**kwargs)
             else:

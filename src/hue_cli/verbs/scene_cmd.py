@@ -114,13 +114,19 @@ def scene_apply(ctx: click.Context, target: str, transition_ms: int | None) -> N
     transitiontime = _ms_to_deciseconds(transition_ms) if transition_ms is not None else None
 
     async def _run() -> None:
-        scenes = await wrapper.list_scenes_records()
-        scene = _resolve_scene(scenes, target)
-        await wrapper.apply_scene(
-            scene_id=str(scene["id"]),
-            group_id=scene.get("group_id"),
-            transitiontime=transitiontime,
-        )
+        # Match the set/onoff verbs: hold one connection across the resolve +
+        # dispatch pair so we don't pay two TCP/TLS handshakes per apply. The
+        # wrapper is idempotent under nested ``async with`` (its
+        # ``_owns_connection`` flag tracks the outer scope) so this is safe even
+        # on direct ``HueWrapper`` instances.
+        async with wrapper:
+            scenes = await wrapper.list_scenes_records()
+            scene = _resolve_scene(scenes, target)
+            await wrapper.apply_scene(
+                scene_id=str(scene["id"]),
+                group_id=scene.get("group_id"),
+                transitiontime=transitiontime,
+            )
 
     try:
         asyncio.run(_run())
