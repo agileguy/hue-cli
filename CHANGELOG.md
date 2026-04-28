@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.0] — 2026-04-28
+
+### Added — Phase 3 (groups, batch, polish) — final SRD §16.3 deliverable
+
+- **`batch` verb (FR-53, FR-54, FR-54a/b/c)** — `--file <path>` and `--stdin` accept newline-delimited
+  `hue-cli` invocations (minus the leading `hue-cli` token). `shlex` tokenization handles quoted
+  args. Empty input → exit 0. Comments (lines starting with `#`) and blank lines skipped silently.
+  `--concurrency N` overrides `[defaults] concurrency = 5`. Each line emits one JSONL result record
+  (`line`, `verb`, `target`, `ok`, `duration_ms`, `error`, `result`). Records stream in completion
+  order so partial output survives mid-batch SIGINT.
+- **§11.1 exit-code collapse (`aggregate_exit_code`)** — empty/all-ok → 0; mixed (≥1 ok + ≥1 fail) → 7;
+  all-fail-uniform → that code; multi-mode-fail → 7. Pure function, eight test branches.
+- **FR-54c graceful drain on SIGINT/SIGTERM** — async-aware signal handlers via `loop.add_signal_handler`;
+  on signal: cease dispatching, give in-flight tasks ≤2 seconds to finish, cancel the rest, emit
+  `{"event":"interrupted","completed":N,"pending":M}` JSONL summary line, exit 130/143.
+- **`group list` verb (FR-51)** — alias for `list rooms` + `list zones` merged. Bridge-stored groups
+  only (LightGroup/Luminaire/Entertainment excluded per Hue v1 conventions).
+- **Reentrant wrapper** — `HueWrapper.__aenter__/__aexit__` use a depth counter so a single outer
+  `async with wrapper:` in `_run_batch` amortizes one TCP+TLS handshake across the entire batch.
+  Inner per-verb `async with` calls become no-ops.
+
+### Fixed during Phase 3 review
+
+- **Dispatch race** — task creation now yields between `create_task` calls so the signal handler
+  can fire mid-loop. Previously every task was queued before any `await` boundary.
+- **Drain budget enforcement** — replaced unbounded `await asyncio.gather(*tasks)` with a
+  `_wait_with_cancel` helper that races task completion against `cancel_event.wait()`. Pending
+  tasks are reaped via `gather(*pending, return_exceptions=True)` to suppress aiohttp
+  `Unclosed connection` ResourceWarnings.
+- **Streaming partial results on cancel** — `_run_batch` accepts an `on_result` callback so JSONL
+  records hit stdout as each task completes (not buffered until end). On mid-batch SIGINT, the
+  operator sees N completed records + summary line.
+- **Mid-flight cancel test** — rewritten to schedule `cancel_after()` via `asyncio.create_task`
+  BEFORE awaiting `_run_batch` so the drain path is actually exercised. Slow ops + concurrency=2
+  guarantee real mid-flight state. Verified RED→GREEN: 20s → <2.5s after fix.
+
+### Changed
+
+- **JSONL emission order** — batch results stream in completion order, not input order. The SRD
+  doesn't mandate input ordering; completion order is the better operator UX (records appear as
+  they land) and is required for the streaming-on-cancel contract above.
+- **Inline `#` parser behavior documented** — `# comment line` is honored only as the FIRST char
+  of a line. `on @kitchen # note` is a parse error (shlex preserves `#` as a token). Trailing
+  comments must be on their own line.
+
 ## [0.3.0] — 2026-04-28
 
 ### Added — Phase 2 (state control, scenes, sensors, file logging)

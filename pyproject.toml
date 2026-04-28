@@ -1,13 +1,13 @@
 [project]
 name = "hue-cli"
-version = "0.3.0"
+version = "1.0.0"
 description = "Deterministic local-LAN CLI for Philips Hue Bridges"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11,<4.0"
 authors = [{ name = "Dan Elliott" }]
 classifiers = [
-  "Development Status :: 2 - Pre-Alpha",
+  "Development Status :: 4 - Beta",
   "Environment :: Console",
   "Intended Audience :: System Administrators",
   "License :: OSI Approved :: MIT License",
