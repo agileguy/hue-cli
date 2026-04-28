@@ -111,8 +111,7 @@ def load_config(explicit_path: Path | None = None) -> HueConfig:
                 f"config file not found at {path}",
                 hint=f"Create {path} or unset {ENV_VAR}.",
             )
-        # Edge: explicit was False but path was determined from default existence — should not
-        # happen because resolve_path already filtered, but guard anyway.
+        # TOCTOU: default file vanished between resolve_path and now — fall back silently.
         return HueConfig(source_path=None)
 
     try:

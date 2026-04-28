@@ -5,10 +5,8 @@ from __future__ import annotations
 import json
 import os
 import stat
-from collections.abc import AsyncIterator, Iterator
-from dataclasses import dataclass
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
 
 import aiohue.errors
 import pytest
@@ -49,15 +47,6 @@ def isolated_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator
     target = tmp_path / "config.toml"
     monkeypatch.setenv(config_mod.ENV_VAR, str(target))
     yield target
-
-
-@dataclass(frozen=True)
-class _FakeDiscoveredHueBridge:
-    """Stand-in for aiohue.discovery.DiscoveredHueBridge."""
-
-    host: str
-    id: str
-    supports_v2: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -380,17 +369,3 @@ def _patch_hostname(monkeypatch: pytest.MonkeyPatch) -> None:
     """Make ``socket.gethostname`` deterministic so app_name assertions are stable."""
 
     monkeypatch.setattr("socket.gethostname", lambda: "testhost.local")
-
-
-# Static-analysis touch: keep the imported symbols referenced so tools don't strip them.
-_unused: tuple[type, type, type, type] = (
-    BridgeCredentials,
-    CredentialsStore,
-    PermissiveCredentialsError,
-    UnknownVersionError,
-)
-
-
-# Type-check probe to ensure AsyncIterator is referenced (used in fixture annotations).
-def _probe(_x: AsyncIterator[Any]) -> None:  # pragma: no cover
-    return None

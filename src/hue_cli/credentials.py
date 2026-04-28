@@ -17,6 +17,7 @@ Per SRD §6.3 / FR-9 / FR-CRED-1..7. The on-disk schema is JSON:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import stat
@@ -25,7 +26,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from hue_cli.errors import (
-    AuthError,
     ConfigError,
     HueCliError,
     NotPairedError,
@@ -180,18 +180,14 @@ def save(store: CredentialsStore) -> None:
                 f.flush()
                 os.fsync(f.fileno())
         except BaseException:
-            with contextlib_suppress(OSError):
+            with contextlib.suppress(OSError):
                 os.close(fd)
             raise
         os.replace(tmp_path, path)
     except BaseException:
-        with contextlib_suppress(FileNotFoundError):
+        with contextlib.suppress(FileNotFoundError):
             tmp_path.unlink()
         raise
-
-    # Belt-and-braces: re-chmod the destination in case the rename crossed filesystems and
-    # somehow drifted. Race-free fchmod above is the primary control.
-    os.chmod(path, 0o600)
 
 
 def append_bridge(bridge_id: str, creds: BridgeCredentials) -> None:
@@ -239,29 +235,8 @@ def _verify_mode_0600(path: Path) -> None:
         )
 
 
-# Local helper to avoid an extra top-level import while still being explicit.
-class contextlib_suppress:  # noqa: N801 — deliberate snake_case alias for inline use
-    """Context manager that swallows the listed exception types."""
-
-    def __init__(self, *exceptions: type[BaseException]) -> None:
-        self._exceptions = exceptions
-
-    def __enter__(self) -> None:
-        return None
-
-    def __exit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: object,
-    ) -> bool:
-        return exc_type is not None and issubclass(exc_type, self._exceptions)
-
-
-# Re-export AuthError so callers can `except errors.AuthError` without importing both modules.
 __all__ = [
     "CURRENT_VERSION",
-    "AuthError",
     "BridgeCredentials",
     "CredentialsError",
     "CredentialsStore",

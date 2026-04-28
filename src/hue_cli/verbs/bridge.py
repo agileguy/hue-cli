@@ -312,5 +312,4 @@ async def _discover_one_impl(host: str, timeout: float) -> list[wrapper.Discover
     return [result]
 
 
-# Tests reach into these helpers; expose them.
-__all__ = ["_resolve_pair_target", "bridge_group"]
+__all__ = ["bridge_group"]
