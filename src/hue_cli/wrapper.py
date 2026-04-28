@@ -96,8 +96,16 @@ class HueWrapper:
     async def _open(self) -> None:
         if self._bridge is not None:
             return
-        self._bridge = aiohue.HueBridgeV1(self.host, self.app_key)
-        await self._bridge.initialize()
+        # Assign to a local first so a failed initialize() doesn't leave
+        # ``self._bridge`` half-set (a subsequent _open() call must retry,
+        # not silently no-op against a never-initialized bridge object).
+        bridge = aiohue.HueBridgeV1(self.host, self.app_key)
+        try:
+            await bridge.initialize()
+        except BaseException:
+            self._bridge = None
+            raise
+        self._bridge = bridge
 
     async def _close(self) -> None:
         if self._bridge is not None:
@@ -297,9 +305,28 @@ def _bri_to_percent(bri: Any) -> int | None:
 
 
 def _light_to_record(light: Any) -> dict[str, Any]:
+    # aiohue ``Light.state`` is a property returning ``raw["state"]`` — a plain
+    # dict, not an object. ``getattr(state_dict, "on")`` would silently miss the
+    # ``on`` key and yield the default. Use dict access when state is a dict;
+    # fall back to attribute access for unusual mocks. Same for state["reachable"].
     state_obj = _safe(light, "state")
     state: dict[str, Any] = {}
-    if state_obj is not None:
+    if isinstance(state_obj, dict):
+        bri = state_obj.get("bri")
+        state = {
+            "on": bool(state_obj.get("on", False)),
+            "reachable": bool(state_obj.get("reachable", False)),
+            "brightness": int(bri) if isinstance(bri, int) else None,
+            "brightness_percent": _bri_to_percent(bri),
+            "color_mode": state_obj.get("colormode"),
+            "xy": state_obj.get("xy"),
+            "ct_mireds": state_obj.get("ct"),
+            "hue": state_obj.get("hue"),
+            "sat": state_obj.get("sat"),
+            "effect": state_obj.get("effect", "none"),
+            "alert": state_obj.get("alert", "none"),
+        }
+    elif state_obj is not None:
         bri = _safe(state_obj, "bri")
         state = {
             "on": bool(_safe(state_obj, "on", False)),
@@ -315,6 +342,8 @@ def _light_to_record(light: Any) -> dict[str, Any]:
             "alert": _safe(state_obj, "alert", "none"),
         }
 
+    # ``controlcapabilities`` is a property on aiohue's Light returning a dict
+    # (``raw["capabilities"]["control"]``); attribute access here is correct.
     capabilities_obj = _safe(light, "controlcapabilities") or {}
     if isinstance(capabilities_obj, dict):
         ct = capabilities_obj.get("ct") or {}
@@ -343,6 +372,8 @@ def _light_to_record(light: Any) -> dict[str, Any]:
 
 
 def _group_to_record(group: Any) -> dict[str, Any]:
+    # aiohue ``Group.state`` is a ``GroupState`` TypedDict (dict subclass). We
+    # accept either dict or attribute-bearing mocks for safety.
     state_obj = _safe(group, "state") or {}
     if isinstance(state_obj, dict):
         any_on = bool(state_obj.get("any_on", False))
@@ -352,10 +383,14 @@ def _group_to_record(group: Any) -> dict[str, Any]:
         all_on = bool(_safe(state_obj, "all_on", False))
     light_ids = _safe(group, "lights") or []
     sensor_ids = _safe(group, "sensors") or []
+    # ``class`` is a Python keyword; aiohue does not expose it as a property,
+    # so it lives only in ``group.raw["class"]``.
+    raw = _safe(group, "raw") or {}
+    group_class = raw.get("class") if isinstance(raw, dict) else None
     return {
         "id": str(_safe(group, "id", "")),
         "type": _safe(group, "type"),
-        "class": _safe(group, "class_") or _safe(group, "klass"),
+        "class": group_class,
         "name": _safe(group, "name", ""),
         "light_ids": [str(x) for x in light_ids],
         "sensor_ids": [str(x) for x in sensor_ids],
@@ -364,12 +399,23 @@ def _group_to_record(group: Any) -> dict[str, Any]:
 
 
 def _scene_to_record(scene: Any, valid_group_ids: set[str]) -> dict[str, Any]:
-    raw_group_id = _safe(scene, "group")
+    # aiohue's ``Scene`` exposes ``lights`` as a property but does NOT expose
+    # ``group`` (the underlying group id for GroupScene-typed scenes lives only
+    # in ``raw["group"]``). Read from raw for the group id; fall back to
+    # attribute lookup so non-aiohue mocks still work.
+    raw = _safe(scene, "raw") or {}
+    raw_group_id = raw.get("group") if isinstance(raw, dict) else None
+    if raw_group_id is None:
+        raw_group_id = _safe(scene, "group")
     group_id = str(raw_group_id) if raw_group_id is not None else None
     stale = group_id is not None and group_id not in {str(x) for x in valid_group_ids}
     if stale:
         group_id = None
-    light_ids = _safe(scene, "lights") or []
+    light_ids = _safe(scene, "lights")
+    if light_ids is None and isinstance(raw, dict):
+        light_ids = raw.get("lights", [])
+    if light_ids is None:
+        light_ids = []
     return {
         "id": str(_safe(scene, "id", "")),
         "name": _safe(scene, "name", ""),
@@ -418,9 +464,20 @@ def _bridge_to_record(bridge: Any) -> dict[str, Any]:
     config = _safe(bridge, "config")
     if config is None:
         return {}
-    raw_id = _safe(config, "bridgeid") or _safe(config, "bridge_id") or ""
+    # aiohue's ``Config`` exposes only a few real properties (bridgeid, name,
+    # mac, modelid, swversion, apiversion); everything else (ipaddress,
+    # gateway, netmask, timezone, zigbeechannel, whitelist) lives only in
+    # ``config.raw``. Read network/zigbee/whitelist fields from raw and keep
+    # the property accesses for the ones aiohue actually exposes.
+    raw = _safe(config, "raw") or {}
+    if not isinstance(raw, dict):
+        raw = {}
+
+    raw_id = _safe(config, "bridgeid") or _safe(config, "bridge_id") or raw.get("bridgeid") or ""
     bid = normalize_id(str(raw_id)) if raw_id else ""
-    whitelist_raw = _safe(config, "whitelist") or {}
+
+    # ``whitelist`` on a v1 bridge is a dict keyed by app-key id, not a list.
+    whitelist_raw = raw.get("whitelist") or {}
     whitelist: list[dict[str, Any]] = []
     if isinstance(whitelist_raw, dict):
         for key, entry in whitelist_raw.items():
@@ -434,21 +491,27 @@ def _bridge_to_record(bridge: Any) -> dict[str, Any]:
                     "create_date": entry.get("create date") or entry.get("create_date"),
                 }
             )
+
     return {
         "id": bid,
-        "name": _safe(config, "name", ""),
-        "host": _safe(config, "ipaddress") or _safe(config, "ip", ""),
-        "mac": _safe(config, "mac", ""),
-        "model_id": _safe(config, "modelid"),
-        "api_version": _safe(config, "apiversion"),
-        "swversion": _safe(config, "swversion"),
-        "supports_v2": bool(_safe(config, "supports_v2", False)),
+        "name": _safe(config, "name", "") or raw.get("name", ""),
+        "host": raw.get("ipaddress") or raw.get("ip", ""),
+        "mac": _safe(config, "mac", "") or raw.get("mac", ""),
+        "model_id": _safe(config, "modelid") or raw.get("modelid"),
+        "api_version": _safe(config, "apiversion") or raw.get("apiversion"),
+        "swversion": _safe(config, "swversion") or raw.get("swversion"),
+        # ``supports_v2`` is a discovery-time capability (probed via
+        # aiohue.discovery.is_v2_bridge in DiscoveredBridge), NOT a field on
+        # the v1 Config endpoint. Surface ``None`` here to make the
+        # absence explicit; ``bridge discover`` and the cached
+        # DiscoveredBridge record carry the real value.
+        "supports_v2": None,
         "paired_at": None,
         "reachable": True,
-        "gateway": _safe(config, "gateway"),
-        "netmask": _safe(config, "netmask"),
-        "timezone": _safe(config, "timezone"),
-        "zigbee_channel": _safe(config, "zigbeechannel"),
+        "gateway": raw.get("gateway"),
+        "netmask": raw.get("netmask"),
+        "timezone": raw.get("timezone"),
+        "zigbee_channel": raw.get("zigbeechannel"),
         "whitelist": whitelist,
     }
 
