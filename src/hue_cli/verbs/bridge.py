@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import socket
 import sys
 from datetime import UTC, datetime
@@ -156,7 +157,7 @@ def pair_cmd(
             )
             raise SystemExit(64) from exc
 
-    app_name = f"hue-cli#{socket.gethostname().split('.')[0]}"
+    app_name = _build_devicetype("hue-cli", socket.gethostname().split(".")[0])
     try:
         app_key = asyncio.run(
             wrapper.pair(
@@ -310,6 +311,36 @@ async def _discover_one_impl(host: str, timeout: float) -> list[wrapper.Discover
             hint="Verify the IP and that the bridge is on the same LAN.",
         )
     return [result]
+
+
+# --- helpers ----------------------------------------------------------------
+
+# Hue v1 ``devicetype`` field (used during pair / create-app-key) is documented
+# as "<application_name>#<devicename>" with a 40-char total cap and an allowed
+# alphabet of alphanumerics, space, and ``_:-``. The bridge silently truncates
+# longer values, which makes diagnostics harder; sanitize and truncate here so
+# the registered devicetype is exactly what we send.
+_DEVICETYPE_MAX = 40
+_DEVICETYPE_ALLOWED = re.compile(r"[^A-Za-z0-9 _:\-]")
+
+
+def _build_devicetype(app_name: str, device_name: str) -> str:
+    """Return a Hue-v1-safe ``<app>#<device>`` string under 40 chars.
+
+    Sanitizes both halves to the allowed alphabet (alphanumerics, space, and
+    ``_:-``) by replacing illegal characters with ``-``. Then truncates the
+    composed string to 40 chars from the right (we keep the prefix so the
+    application name remains identifiable in the bridge whitelist).
+    """
+
+    safe_app = _DEVICETYPE_ALLOWED.sub("-", app_name) or "hue-cli"
+    safe_dev = _DEVICETYPE_ALLOWED.sub("-", device_name) or "host"
+    composed = f"{safe_app}#{safe_dev}"
+    if len(composed) <= _DEVICETYPE_MAX:
+        return composed
+    # Keep the application prefix and ``#`` separator; trim the device tail.
+    keep_for_dev = max(0, _DEVICETYPE_MAX - len(safe_app) - 1)
+    return f"{safe_app}#{safe_dev[:keep_for_dev]}"
 
 
 __all__ = ["bridge_group"]

@@ -171,9 +171,13 @@ def _resolve_wrapper(
     if bridge_ip is not None and app_key is not None:
         return HueWrapper(bridge_ip, app_key)
 
+    # Catch ONLY the not-paired-yet case here. Other credential errors
+    # (mode 0644, unknown version, malformed JSON) are real operator-visible
+    # problems that must surface — not silently re-routed to a generic
+    # "No active bridge wrapper" downstream.
     try:
         store = credentials.load()
-    except Exception:
+    except credentials.MissingCredentialsError:
         return None
 
     if not store.bridges:
