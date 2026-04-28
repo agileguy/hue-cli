@@ -15,6 +15,7 @@ from typing import Any
 import pytest
 from click.testing import CliRunner
 
+from hue_cli import logging_setup
 from hue_cli.cli import main
 from hue_cli.output import OutputFormat
 
@@ -444,6 +445,72 @@ class TestEmptySet:
         # operator likely typed something incomplete.
         assert result.exit_code == 64
         assert light.set_state_calls == []
+
+
+# --- FR-31 gamut B fallback -------------------------------------------------
+
+
+class TestGamutBFallback:
+    @pytest.fixture(autouse=True)
+    def _reset_logging(self) -> Any:
+        # The hue_cli logger's stderr handler caches ``sys.stderr`` at attach
+        # time. Earlier tests in the suite may have attached a handler against
+        # a now-defunct CliRunner stderr stream, leaving subsequent invocations
+        # unable to surface warnings into ``result.stderr``. Resetting here
+        # forces ``setup_logging`` to re-attach a fresh handler against the
+        # current CliRunner's captured stderr.
+        logging_setup.reset_for_tests()
+        yield
+        logging_setup.reset_for_tests()
+
+    def test_hex_succeeds_when_light_advertises_no_gamut(self) -> None:
+        # FR-31: when the device doesn't advertise a colorgamut, the verb
+        # falls back to gamut B and warns on stderr. The call must still
+        # succeed end-to-end (operator's --hex reaches the bridge). Assert
+        # against the stderr handler that ``setup_logging`` configures — that
+        # handler routes WARNING records to stderr at default level (no -v
+        # required), which is exactly what FR-31 demands.
+        light = FakeLight(
+            "1",
+            "OldBulb",
+            controlcapabilities={
+                # ``ct`` present so capability gating doesn't refuse, but no
+                # ``colorgamut`` triangle — only a vestigial ``colorgamuttype``
+                # so the FR-36 color gate lets the call through (operators
+                # occasionally see this shape on legacy color bulbs).
+                "ct": {"min": 153, "max": 500},
+                "colorgamuttype": "other",
+            },
+        )
+        wrapper = FakeWrapper(target_lookup={"OldBulb": _light_record(light)})
+        runner = CliRunner()
+        result = runner.invoke(main, ["set", "OldBulb", "--hex", "#ff0000"], obj=_ctx(wrapper))
+        assert result.exit_code == 0, result.output
+        assert len(light.set_state_calls) == 1
+        assert "xy" in light.set_state_calls[0]
+        # FR-31: WARNING-level stderr emission. The hue_cli logger's stderr
+        # handler emits a JsonLineFormatter line containing the warning text.
+        # Click's CliRunner concatenates stderr into ``result.output`` by default.
+        combined = result.output
+        if result.stderr_bytes is not None:
+            combined += result.stderr
+        assert "gamut B" in combined, f"expected gamut B warning, got: {combined!r}"
+        assert "OldBulb" in combined
+        assert '"level":"WARNING"' in combined  # JsonLineFormatter shape
+
+    def test_brightness_only_does_not_warn_about_gamut(self) -> None:
+        # A bare --brightness call doesn't need a gamut, so the FR-31 fallback
+        # path should stay silent. (Avoids spam when operators just dim a
+        # legacy bulb that lacks colorgamut metadata.)
+        light = FakeLight("1", "OldPlug", controlcapabilities={})
+        wrapper = FakeWrapper(target_lookup={"OldPlug": _light_record(light)})
+        runner = CliRunner()
+        result = runner.invoke(main, ["set", "OldPlug", "--brightness", "40"], obj=_ctx(wrapper))
+        assert result.exit_code == 0, result.output
+        combined = result.output
+        if result.stderr_bytes is not None:
+            combined += result.stderr
+        assert "gamut B" not in combined
 
 
 # --- CLI registration -------------------------------------------------------

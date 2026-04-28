@@ -56,6 +56,22 @@ _NAMED_COLORS: Mapping[str, tuple[float, float]] = {
 }
 
 
+# --- FR-31 fallback gamut ----------------------------------------------------
+
+GAMUT_B: list[list[float]] = [
+    [0.6750, 0.3220],
+    [0.4090, 0.5180],
+    [0.1670, 0.0400],
+]
+"""The most common 2014-era Hue gamut.
+
+FR-31 fallback when ``light.controlcapabilities`` does not advertise a
+``colorgamut`` triangle. Operators on older bulbs without an advertised gamut
+get a sensible clamp instead of unclamped sRGB → xy values that the bridge
+would silently reshape.
+"""
+
+
 def named_colors() -> dict[str, tuple[float, float]]:
     """Return a fresh dict copy of the FR-32 built-in name → xy table.
 

@@ -25,11 +25,13 @@ underlying aiohttp ``ClientSession`` stays alive between the resolve call
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import TYPE_CHECKING, Any, cast
 
 import click
 
 from hue_cli.colors import (
+    GAMUT_B,
     hex_to_xy,
     hsv_to_xy,
     kelvin_to_mireds,
@@ -38,6 +40,8 @@ from hue_cli.colors import (
     percent_to_bri,
 )
 from hue_cli.errors import HueCliError, UnsupportedError, UsageError, emit_structured_error
+
+_LOG = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from hue_cli._protocols import GroupProto, HueWrapperProto, LightProto
@@ -371,7 +375,20 @@ async def _apply_set(
                 wants_color=wants_color,
             )
             caps = _light_capabilities(obj)
-            gamut = caps.get("colorgamut") if isinstance(caps, dict) else None
+            raw_gamut = caps.get("colorgamut") if isinstance(caps, dict) else None
+            # FR-31: when the device doesn't advertise a colorgamut, fall back
+            # to gamut B (the most common 2014-era gamut) and warn on stderr
+            # so the operator knows the clamp triangle isn't device-authoritative.
+            # Only warn when the operator actually asked for a chromaticity-driven
+            # color flag — a bare --brightness or --effect call doesn't need a gamut.
+            if wants_color and not (isinstance(raw_gamut, list) and raw_gamut):
+                _LOG.warning(
+                    "light %r reports no colorgamut; falling back to gamut B per FR-31",
+                    target,
+                )
+                light_gamut: list[list[float]] | None = GAMUT_B
+            else:
+                light_gamut = raw_gamut if isinstance(raw_gamut, list) else None
             state = _assemble_state(
                 brightness=brightness,
                 kelvin=kelvin,
@@ -384,7 +401,7 @@ async def _apply_set(
                 effect=effect,
                 alert=alert,
                 light_caps=caps,
-                light_gamut=gamut if isinstance(gamut, list) else None,
+                light_gamut=light_gamut,
             )
             await wrapper.light_set_state(cast("LightProto", obj), **state)
             return {"target": target, "kind": "light", "state": state}
