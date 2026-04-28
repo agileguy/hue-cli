@@ -26,11 +26,14 @@ from typing import Any
 import click
 
 from hue_cli import __version__
+from hue_cli.logging_setup import setup_logging
 from hue_cli.output import detect
 from hue_cli.verbs.config_cmd import config_group
 from hue_cli.verbs.info_cmd import info_cmd
 from hue_cli.verbs.list_cmd import list_group
 from hue_cli.verbs.onoff_cmd import off_cmd, on_cmd, toggle_cmd
+from hue_cli.verbs.scene_cmd import scene_group
+from hue_cli.verbs.sensor_cmd import sensor_group
 from hue_cli.verbs.set_cmd import set_cmd
 
 # --- Async graceful runner ---------------------------------------------------
@@ -143,12 +146,46 @@ def main(
     ctx.obj["no_probe"] = no_probe
     ctx.obj["verbose"] = verbose
 
+    # Wire -v / -vv plus optional [logging] file (§7.3). Config loading is
+    # best-effort here: a config-file syntax error must not break ``--help``
+    # / ``--version``, so we fall back to verbose-flag-only on any
+    # ConfigError. The config_cmd verb path will surface real config errors
+    # to operators who run ``hue-cli config show``.
+    _setup_logging_from_config(verbose, config_path)
+
     # Tests inject a fake wrapper directly via ``runner.invoke(..., obj={"wrapper": fake})``;
     # for those invocations ``ctx.obj["wrapper"]`` is already populated and we leave it alone.
     # Otherwise, build a real ``HueWrapper`` from credentials when available so verbs that
     # need a connected bridge can find one in ``ctx.obj["wrapper"]``.
     if "wrapper" not in ctx.obj:
         ctx.obj["wrapper"] = _resolve_wrapper(bridge_alias, bridge_ip, app_key)
+
+
+def _setup_logging_from_config(verbose: int, config_path: str | None) -> None:
+    """Apply the verbose flag and (optionally) attach the [logging] file handler.
+
+    Reads ``[logging] file`` from the resolved :class:`HueConfig` so a
+    persistent path-based audit log captures ``-v``/``-vv`` output alongside
+    stderr. Config-load failures degrade silently — verbose flags still work,
+    operators see the real config error when they run a verb that touches
+    the config explicitly (``hue-cli config show``/``validate``).
+    """
+
+    file_path: str | None = None
+    try:
+        from pathlib import Path
+
+        from hue_cli.config import load_config
+
+        explicit = Path(config_path).expanduser() if config_path else None
+        cfg = load_config(explicit_path=explicit)
+        file_path = cfg.logging.file
+    except Exception:
+        # Any config error -> degrade to flag-only logging. The dedicated
+        # config_cmd verb path is where operators see config errors loud.
+        file_path = None
+
+    setup_logging(verbose, file_path)
 
 
 def _resolve_wrapper(
@@ -206,6 +243,8 @@ main.add_command(on_cmd, name="on")
 main.add_command(off_cmd, name="off")
 main.add_command(toggle_cmd, name="toggle")
 main.add_command(set_cmd, name="set")
+main.add_command(scene_group, name="scene")
+main.add_command(sensor_group, name="sensor")
 main.add_command(config_group, name="config")
 
 
