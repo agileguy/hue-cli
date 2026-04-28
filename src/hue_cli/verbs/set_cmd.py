@@ -164,9 +164,17 @@ def _supports_color(caps: dict[str, Any]) -> bool:
 
 
 def _supports_ct(caps: dict[str, Any]) -> bool:
-    """True if the light advertises a ``ct`` (color-temperature) range."""
-    ct = caps.get("ct")
-    return isinstance(ct, dict) and bool(ct)
+    """True if the light advertises a ``ct`` (color-temperature) capability key.
+
+    Real-world Hue White bulbs (e.g., LWA001 firmware variants) publish
+    ``controlcapabilities = {"ct": {}}`` — the capability key with an empty
+    range dict. Older code gated on ``bool(ct)`` and falsely refused
+    ``--kelvin`` on these bulbs. The bridge is the authoritative gate; if the
+    capability key is present, we let the call through. ``_maybe_clamp_ct``
+    still uses ``ct.get("min")`` / ``ct.get("max")`` for in-range clamping
+    when those values are populated.
+    """
+    return "ct" in caps
 
 
 def _enforce_light_caps(

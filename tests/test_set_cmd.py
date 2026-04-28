@@ -374,6 +374,25 @@ class TestCapabilities:
         result = runner.invoke(main, ["set", "Plug", "--brightness", "50"], obj=_ctx(wrapper))
         assert result.exit_code == 0, result.output
 
+    def test_kelvin_succeeds_when_ct_dict_empty(self) -> None:
+        # Real-world Hue White bulbs (LWA001 firmware variants) publish
+        # ``controlcapabilities = {"ct": {}}`` — capability key present but
+        # range dict empty. The bridge is the authoritative gate; the verb
+        # must let the call through and skip device-side clamp. The "no ct
+        # key at all" companion path is covered by
+        # ``test_kelvin_on_fixed_color_only_exits_5`` above.
+        light = FakeLight(
+            "1",
+            "WhiteOnly",
+            controlcapabilities={"ct": {}},
+        )
+        wrapper = FakeWrapper(target_lookup={"WhiteOnly": _light_record(light)})
+        runner = CliRunner()
+        result = runner.invoke(main, ["set", "WhiteOnly", "--kelvin", "2700"], obj=_ctx(wrapper))
+        assert result.exit_code == 0, result.output
+        # 1_000_000/2700 ≈ 370. No min/max range advertised, so no clamp.
+        assert light.set_state_calls == [{"ct": 370}]
+
 
 # --- Group + 'all' dispatch (FR-22) -----------------------------------------
 
