@@ -95,6 +95,32 @@ def scene_group() -> None:
     """Apply or list saved scenes (FR-39..42)."""
 
 
+async def _apply_scene_apply(
+    wrapper: HueWrapperProto,
+    target: str,
+    *,
+    transition_ms: int | None = None,
+) -> dict[str, Any]:
+    """Resolve a scene name/id and apply it (FR-39..41).
+
+    Exposed as a callable async core so the ``batch`` verb can dispatch
+    ``scene apply <name>`` lines directly without re-entering Click. Same
+    error surface as the Click command: :class:`AmbiguousTargetError` /
+    :class:`NotFoundError` propagate to the caller.
+    """
+    transitiontime = _ms_to_deciseconds(transition_ms) if transition_ms is not None else None
+
+    async with wrapper:
+        scenes = await wrapper.list_scenes_records()
+        scene = _resolve_scene(scenes, target)
+        await wrapper.apply_scene(
+            scene_id=str(scene["id"]),
+            group_id=scene.get("group_id"),
+            transitiontime=transitiontime,
+        )
+    return {"target": target, "scene_id": str(scene["id"]), "group_id": scene.get("group_id")}
+
+
 @scene_group.command("apply")
 @click.argument("target")
 @click.option(
@@ -111,25 +137,8 @@ def scene_apply(ctx: click.Context, target: str, transition_ms: int | None) -> N
     fmt = _get_format(ctx)
     json_mode = fmt in (OutputFormat.JSON, OutputFormat.JSONL)
 
-    transitiontime = _ms_to_deciseconds(transition_ms) if transition_ms is not None else None
-
-    async def _run() -> None:
-        # Match the set/onoff verbs: hold one connection across the resolve +
-        # dispatch pair so we don't pay two TCP/TLS handshakes per apply. The
-        # wrapper is idempotent under nested ``async with`` (its
-        # ``_owns_connection`` flag tracks the outer scope) so this is safe even
-        # on direct ``HueWrapper`` instances.
-        async with wrapper:
-            scenes = await wrapper.list_scenes_records()
-            scene = _resolve_scene(scenes, target)
-            await wrapper.apply_scene(
-                scene_id=str(scene["id"]),
-                group_id=scene.get("group_id"),
-                transitiontime=transitiontime,
-            )
-
     try:
-        asyncio.run(_run())
+        asyncio.run(_apply_scene_apply(wrapper, target, transition_ms=transition_ms))
     except AmbiguousTargetError as exc:
         emit_structured_error(exc, target=target, json_mode=json_mode)
         sys.exit(exc.exit_code)
